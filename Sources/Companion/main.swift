@@ -558,6 +558,7 @@ private final class WorkspaceStripView: NSView {
     private var compartmentViews: [NSView] = []
     private var contentViews: [WorkspaceContentView] = []
     private var workspaceBackgrounds: [NSView] = []
+    private var renderedWorkspaces: [Workspace] = []
     private var forceLayoutRebuild = false
     var contextMenu: NSMenu?
 
@@ -612,9 +613,9 @@ private final class WorkspaceStripView: NSView {
         focusWindow = onFocusWindow
 
         let sameStructure = !forceLayoutRebuild &&
-            self.workspaces.count == self.workspaces.count &&
-            self.workspaces.map(\.name) == self.workspaces.map(\.name) &&
-            zip(self.workspaces, self.workspaces).allSatisfy { $0.windows == $1.windows }
+            renderedWorkspaces.count == self.workspaces.count &&
+            renderedWorkspaces.map(\.name) == self.workspaces.map(\.name) &&
+            zip(renderedWorkspaces, self.workspaces).allSatisfy { $0.windows == $1.windows }
         if sameStructure && contentViews.count == self.workspaces.count {
             for index in self.workspaces.indices {
                 let workspace = self.workspaces[index]
@@ -627,6 +628,7 @@ private final class WorkspaceStripView: NSView {
                     background.updateFocus(workspace.isFocused)
                 }
             }
+            renderedWorkspaces = self.workspaces
             forceLayoutRebuild = false
             return
         }
@@ -677,7 +679,8 @@ private final class WorkspaceStripView: NSView {
         }
 
         addSubview(contentHost)
-        compartmentViews.append(contentHost);
+        compartmentViews.append(contentHost)
+        renderedWorkspaces = self.workspaces
         invalidateIntrinsicContentSize()
         needsDisplay = true
     }
