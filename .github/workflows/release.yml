@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        default: v0.1-beta
 
 permissions:
   contents: write
@@ -28,6 +34,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Companion 0.1 Beta
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           body: |
             Companion 0.1 Beta
 
@@ -40,3 +48,4 @@ jobs:
           files: Companion-macOS-0.1-beta.zip
           prerelease: true
           make_latest: false
+          generate_release_notes: true
