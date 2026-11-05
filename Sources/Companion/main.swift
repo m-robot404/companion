@@ -181,14 +181,131 @@ private final class AppIconCache {
     }
 }
 
+
+@MainActor
+private final class WorkspaceIconHitView: NSView {
+    var onEnter: ((NSView) -> Void)?
+    var onExit: (() -> Void)?
+    var onPress: ((NSEvent) -> Void)?
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter?(self) }
+    override func mouseExited(with event: NSEvent) { onExit?() }
+    override func mouseDown(with event: NSEvent) { onPress?(event) }
+}
+
+/// ScreenCaptureKit source modeled on the on-demand, cached capture pipeline used by
+/// the open-source HoverDock project (MIT): reuse the shareable-window map briefly and
+/// keep a small in-memory thumbnail cache instead of querying ScreenCaptureKit per hover.
+private actor WindowPreviewSource {
+    static let shared = WindowPreviewSource()
+    private var windowsByID: [CGWindowID: SCWindow] = [:]
+    private var refreshedAt = Date.distantPast
+    private var thumbnails: [CGWindowID: CGImage] = [:]
+    private var thumbnailOrder: [CGWindowID] = []
+    private let cacheLimit = 24
+
+    private func refreshWindowMap() async {
+        guard Date().timeIntervalSince(refreshedAt) >= 1 || windowsByID.isEmpty else { return }
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: false
+        ) else { return }
+        windowsByID = Dictionary(content.windows.map { ($0.windowID, $0) },
+                                 uniquingKeysWith: { _, latest in latest })
+        refreshedAt = Date()
+    }
+
+    func capture(_ window: WorkspaceWindow) async -> CGImage? {
+        let rawValue = window.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedID = rawValue.hasPrefix("0x")
+            ? UInt32(rawValue.dropFirst(2), radix: 16)
+            : UInt32(rawValue)
+        guard let rawID = parsedID else { return nil }
+        let id = CGWindowID(rawID)
+        await refreshWindowMap()
+
+        // Prefer AeroSpace's exact CGWindowID. If ScreenCaptureKit's map is temporarily
+        // out of sync, use a unique bundle-ID + title match; never guess between windows.
+        var target = windowsByID[id]
+        if target == nil {
+            let candidates = windowsByID.values.filter {
+                $0.owningApplication?.bundleIdentifier == window.bundleID
+            }
+            if !window.title.isEmpty {
+                let titleMatches = candidates.filter { $0.title == window.title }
+                if titleMatches.count == 1 { target = titleMatches[0] }
+            }
+            if target == nil && candidates.count == 1 { target = candidates[0] }
+        }
+        guard let target else { return nil }
+        if !target.isOnScreen, let cached = thumbnails[id] { return cached }
+
+        let sourceWidth = max(1, target.frame.width)
+        let sourceHeight = max(1, target.frame.height)
+        let scale = min(1, min(480 / sourceWidth, 270 / sourceHeight))
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(sourceWidth * scale))
+        configuration.height = max(1, Int(sourceHeight * scale))
+        configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: SCContentFilter(desktopIndependentWindow: target),
+                configuration: configuration
+            )
+            thumbnails[id] = image
+            thumbnailOrder.removeAll { $0 == id }
+            thumbnailOrder.append(id)
+            while thumbnailOrder.count > cacheLimit {
+                thumbnails[thumbnailOrder.removeFirst()] = nil
+            }
+            return image
+        } catch {
+            return nil
+        }
+    }
+}
+
+@MainActor
+private final class PreviewHoverHostView: NSView {
+    var onEnter: (() -> Void)?
+    var onExit: (() -> Void)?
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter?() }
+    override func mouseExited(with event: NSEvent) { onExit?() }
+}
+
 @MainActor
 private final class WorkspaceContentView: NSView {
     let workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
-    private var tracking: NSTrackingArea?
     private var previewPopover: NSPopover?
-    private var hoveredGroupID: String?
+    private weak var previewAnchor: NSView?
+    private var previewDismissWorkItem: DispatchWorkItem?
+    private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
          onSelect: @escaping (String) -> Void,
@@ -199,6 +316,7 @@ private final class WorkspaceContentView: NSView {
         super.init(frame: frame)
         setAccessibilityRole(.button)
         setAccessibilityLabel("Workspace \(workspace.name), \(workspace.windows.count) windows")
+        installIconHitTargets()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
@@ -286,44 +404,82 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    private func group(at point: NSPoint) -> AppGroup? {
-        iconFrames().first(where: { $0.0.insetBy(dx: -2, dy: -2).contains(point) })?.1
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        guard let group = group(at: point) else {
-            previewPopover?.close()
-            previewPopover = nil
-            hoveredGroupID = nil
-            return
+    private func installIconHitTargets() {
+        iconHitViews.forEach { $0.removeFromSuperview() }
+        iconHitViews.removeAll()
+        for (frame, group) in iconFrames() {
+            let target = WorkspaceIconHitView(frame: frame)
+            target.onEnter = { [weak self] anchor in
+                self?.previewDismissWorkItem?.cancel()
+                self?.previewDismissWorkItem = nil
+                self?.showPreview(for: group, anchoredTo: anchor)
+            }
+            target.onExit = { [weak self, weak target] in
+                guard let self, self.previewAnchor === target else { return }
+                self.schedulePreviewDismissal()
+            }
+            target.onPress = { [weak self] event in
+                self?.activate(group, event: event)
+            }
+            target.setAccessibilityRole(.button)
+            target.setAccessibilityLabel(group.windows.count == 1
+                ? group.appName : "\(group.appName), \(group.windows.count) windows")
+            addSubview(target)
+            iconHitViews.append(target)
         }
-        guard hoveredGroupID != group.bundleID else { return }
-        hoveredGroupID = group.bundleID
-        showPreview(for: group, at: point)
     }
 
-    override func mouseExited(with event: NSEvent) {
+    private func activate(_ group: AppGroup, event: NSEvent) {
         previewPopover?.close()
         previewPopover = nil
-        hoveredGroupID = nil
+        previewAnchor = nil
+        if group.windows.count == 1, let window = group.windows.first {
+            onFocusWindow(window.id)
+            return
+        }
+        let menu = NSMenu()
+        for window in group.windows {
+            let title = window.title.isEmpty ? group.appName : window.title
+            let item = NSMenuItem(title: title, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = window.id
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    private func showPreview(for group: AppGroup, at point: NSPoint) {
+    private func schedulePreviewDismissal() {
+        previewDismissWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.previewDismissWorkItem = nil
+            let pointer = NSEvent.mouseLocation
+            if self.previewPopover?.contentViewController?.view.window?.frame.contains(pointer) == true {
+                return
+            }
+            self.previewPopover?.close()
+            self.previewPopover = nil
+            self.previewAnchor = nil
+            self.previewDismissWorkItem = nil
+        }
+        previewDismissWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
+    private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
+        previewDismissWorkItem?.cancel()
+        previewDismissWorkItem = nil
+        previewPopover?.close()
+        previewPopover = nil
         let popover = NSPopover()
-        popover.behavior = .transient
+        popover.behavior = .applicationDefined
         let controller = NSViewController()
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        let host = PreviewHoverHostView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        host.onEnter = { [weak self] in
+            self?.previewDismissWorkItem?.cancel()
+            self?.previewDismissWorkItem = nil
+        }
+        host.onExit = { [weak self] in self?.schedulePreviewDismissal() }
         host.wantsLayer = true
         host.layer?.cornerRadius = 10
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
@@ -349,51 +505,23 @@ private final class WorkspaceContentView: NSView {
         }
         controller.view = host
         popover.contentViewController = controller
-        popover.show(relativeTo: NSRect(x: point.x - 2, y: point.y, width: 4, height: 2),
-                     of: self, preferredEdge: .maxY)
+        popover.show(relativeTo: NSRect(x: anchor.bounds.midX - 2, y: anchor.bounds.midY,
+                                        width: 4, height: 2),
+                     of: anchor, preferredEdge: .maxY)
+        previewAnchor = anchor
         previewPopover = popover
     }
 
     private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
-        guard CGPreflightScreenCaptureAccess(), let id = UInt32(window.id) else { return nil }
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let target = content.windows.first(where: { $0.windowID == CGWindowID(id) }) else { return nil }
-            let filter = SCContentFilter(desktopIndependentWindow: target)
-            let configuration = SCStreamConfiguration()
-            configuration.width = 480
-            configuration.height = 270
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-        } catch {
-            return nil
-        }
+        guard let image = await WindowPreviewSource.shared.capture(window) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
         previewPopover?.close()
         previewPopover = nil
-        guard let group = group(at: point) else {
-            onSelect(workspace.name)
-            return
-        }
-        if group.windows.count == 1, let window = group.windows.first {
-            onFocusWindow(window.id)
-            return
-        }
-        let menu = NSMenu()
-        for window in group.windows {
-            let title = window.title.isEmpty ? group.appName : window.title
-            let item = NSMenuItem(title: title, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = window.id
-            menu.addItem(item)
-        }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
+        previewAnchor = nil
+        onSelect(workspace.name)
     }
 
     @objc private func selectWindowFromMenu(_ item: NSMenuItem) {
@@ -474,39 +602,39 @@ private final class WorkspaceStripView: NSView {
                                                 onFocusWindow: { [weak self] id in self?.focusWindow?(id) })
             let background: NSView
             if CompanionPreferences.background == .glass {
-                let glass = NSGlassEffectView(frame: frame)
+                let glass = PassthroughGlassEffectView(frame: frame)
                 glass.cornerRadius = 9 * scale
                 glass.tintColor = workspace.isFocused
                     ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
                     : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
-                glass.contentView = content
                 background = glass
             } else {
-                let plain = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
-                                                      style: CompanionPreferences.background)
-                plain.addSubview(content)
-                content.frame = plain.bounds
-                content.autoresizingMask = [.width, .height]
-                background = plain
+                background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
+                                                       style: CompanionPreferences.background)
             }
+            // Position the interactive view in the same strip coordinates as its
+            // background. Leaving its origin at zero stacks every workspace's hit
+            // targets over the first compartment.
+            content.frame = frame
+            content.autoresizingMask = [.height]
+            // Backgrounds are non-interactive siblings. Each icon hit target remains
+            // independent instead of being swallowed by a glass container's hit area.
             contentHost.addSubview(background)
+            contentHost.addSubview(content)
             compartmentViews.append(background)
             x += frame.width + gap
         }
 
-        if CompanionPreferences.background == .glass {
-            let container = NSGlassEffectContainerView(frame: contentHost.frame)
-            container.spacing = gap
-            container.contentView = contentHost
-            addSubview(container)
-            glassContainer = container
-        } else {
-            addSubview(contentHost)
-            compartmentViews = [contentHost]
-        }
+        addSubview(contentHost)
+        compartmentViews.append(contentHost);
         invalidateIntrinsicContentSize()
         needsDisplay = true
     }
+}
+
+@MainActor
+private final class PassthroughGlassEffectView: NSGlassEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 @MainActor
@@ -520,6 +648,7 @@ private final class CompartmentBackgroundView: NSView {
         wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
                                 xRadius: 9 * CompanionPreferences.size / 22,
