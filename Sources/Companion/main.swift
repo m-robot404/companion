@@ -7,7 +7,7 @@ import ServiceManagement
 
 // MARK: - Crash recording
 // Writes a compact crash marker to ~/Library/Logs/Companion/crash.log.
-// macOS DiagnosticReports remain the source for full crash stacks.
+// macOS DiagnosticReports remain the source for full native crash stacks.
 private enum CrashRecorder {
     static let directory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Companion", isDirectory: true)
@@ -23,7 +23,7 @@ private enum CrashRecorder {
             let descriptor = Darwin.open(logURL.path, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR)
             guard descriptor >= 0 else { return }
             crashLogDescriptor = descriptor
-            append("Session started: \\(ISO8601DateFormatter().string(from: Date()))\\n")
+            append("Session started: \(ISO8601DateFormatter().string(from: Date()))\n")
             NSSetUncaughtExceptionHandler(companionExceptionHandler)
             signal(SIGABRT, companionSignalHandler)
             signal(SIGILL, companionSignalHandler)
@@ -45,27 +45,35 @@ private enum CrashRecorder {
     }
 
     static func record(_ exception: NSException) {
-        let stack = exception.callStackSymbols.joined(separator: "\\n")
-        append("\\nUNCAUGHT EXCEPTION: \\(exception.name.rawValue)\\nReason: \\(exception.reason ?? "unknown")\\n\\(stack)\\n")
+        let stack = exception.callStackSymbols.joined(separator: "\n")
+        append("\nUNCAUGHT EXCEPTION: \(exception.name.rawValue)\nReason: \(exception.reason ?? "unknown")\n\(stack)\n")
     }
 }
 
 private var crashLogDescriptor: Int32 = -1
-private let signalCrashMessages: [Int32: [CChar]] = [
-    SIGABRT: Array("FATAL SIGNAL: SIGABRT\\n".utf8CString),
-    SIGILL: Array("FATAL SIGNAL: SIGILL\\n".utf8CString),
-    SIGSEGV: Array("FATAL SIGNAL: SIGSEGV\\n".utf8CString),
-    SIGBUS: Array("FATAL SIGNAL: SIGBUS\\n".utf8CString),
-    SIGFPE: Array("FATAL SIGNAL: SIGFPE\\n".utf8CString),
-    SIGTRAP: Array("FATAL SIGNAL: SIGTRAP\\n".utf8CString)
-]
+private let sigabrtMessage = Array("FATAL SIGNAL: SIGABRT\n".utf8CString)
+private let sigillMessage = Array("FATAL SIGNAL: SIGILL\n".utf8CString)
+private let sigsegvMessage = Array("FATAL SIGNAL: SIGSEGV\n".utf8CString)
+private let sigbusMessage = Array("FATAL SIGNAL: SIGBUS\n".utf8CString)
+private let sigfpeMessage = Array("FATAL SIGNAL: SIGFPE\n".utf8CString)
+private let sigtrapMessage = Array("FATAL SIGNAL: SIGTRAP\n".utf8CString)
 
 private func companionExceptionHandler(_ exception: NSException) {
     CrashRecorder.record(exception)
 }
 
 private func companionSignalHandler(_ signalNumber: Int32) {
-    if crashLogDescriptor >= 0, let message = signalCrashMessages[signalNumber] {
+    let message: [CChar]
+    switch signalNumber {
+    case SIGABRT: message = sigabrtMessage
+    case SIGILL: message = sigillMessage
+    case SIGSEGV: message = sigsegvMessage
+    case SIGBUS: message = sigbusMessage
+    case SIGFPE: message = sigfpeMessage
+    case SIGTRAP: message = sigtrapMessage
+    default: message = sigabrtMessage
+    }
+    if crashLogDescriptor >= 0 {
         message.withUnsafeBufferPointer { buffer in
             if let base = buffer.baseAddress {
                 _ = Darwin.write(crashLogDescriptor, base, buffer.count - 1)
