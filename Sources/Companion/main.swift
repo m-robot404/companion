@@ -86,7 +86,7 @@ private final class AeroSpaceClient {
         for line in windowText.split(whereSeparator: \.isNewline) {
             let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard fields.count == 2, !fields[0].isEmpty, !fields[1].isEmpty else { continue }
-            if !apps[fields[1, default: []].contains(fields[0]) {
+            if !apps[fields[1], default: []].contains(fields[0]) {
                 apps[fields[1], default: []].append(fields[0])
             }
         }
