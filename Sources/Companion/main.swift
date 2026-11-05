@@ -453,7 +453,13 @@ private final class WorkspaceContentView: NSView {
             }
             target.onExit = { [weak self, weak target] in
                 guard let self, self.previewAnchor === target else { return }
-                self.schedulePreviewDismissal()
+                // The preview is a hover tooltip, not an interactive panel:
+                // dismiss it as soon as the pointer leaves the app icon.
+                self.previewDismissWorkItem?.cancel()
+                self.previewDismissWorkItem = nil
+                self.previewPopover?.close()
+                self.previewPopover = nil
+                self.previewAnchor = nil
             }
             target.onPress = { [weak self] event in
                 self?.activate(group, event: event)
