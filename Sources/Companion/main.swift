@@ -177,7 +177,7 @@ private final class AeroSpaceClient: @unchecked Sendable {
 
         // Read payload
         var responseData = Data()
-        var buffer = [UInt8](<repeating: 0, count: min(expectedBytes, 16384>))
+        var buffer = [UInt8](repeating: 0, count: min(expectedBytes, 16384))
         while responseData.count < expectedBytes {
             let toRead = min(buffer.count, expectedBytes - responseData.count)
             let n = read(fd, &buffer, toRead)
