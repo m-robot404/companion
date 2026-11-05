@@ -481,6 +481,7 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
+        if previewAnchor === anchor, previewPopover?.isShown == true { return }
         previewPopover?.close()
         previewPopover = nil
         let popover = NSPopover()
@@ -605,27 +606,36 @@ private final class WorkspaceStripView: NSView {
             let height = CompanionPreferences.size
             let scale = height / 22
             var x: CGFloat = 6
+            var geometryChanged = false
             for index in self.workspaces.indices {
                 let workspace = self.workspaces[index]
                 let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
-                contentViews[index].frame = frame
-                contentViews[index].updateWorkspace(workspace)
-                workspaceBackgrounds[index].frame = frame
-                if let glass = workspaceBackgrounds[index] as? PassthroughGlassEffectView {
-                    glass.tintColor = workspace.isFocused
-                        ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
-                        : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
-                } else if let background = workspaceBackgrounds[index] as? CompartmentBackgroundView {
-                    background.updateFocus(workspace.isFocused)
+                if contentViews[index].frame != frame {
+                    contentViews[index].frame = frame
+                    workspaceBackgrounds[index].frame = frame
+                    geometryChanged = true
+                }
+                if renderedWorkspaces[index] != workspace {
+                    contentViews[index].updateWorkspace(workspace)
+                    if let background = workspaceBackgrounds[index] as? CompartmentBackgroundView {
+                        background.updateFocus(workspace.isFocused)
+                    }
                 }
                 x += frame.width + gap
             }
-            railBase?.frame = NSRect(x: 0, y: 3 * scale,
-                                     width: measuredWidth, height: height - 6 * scale)
+            let railFrame = NSRect(x: 0, y: 3 * scale,
+                                   width: measuredWidth, height: height - 6 * scale)
+            if let railBase, railBase.frame != railFrame {
+                railBase.frame = railFrame
+                geometryChanged = true
+            }
+            let widthChanged = renderedWorkspaces.isEmpty ||
+                renderedWorkspaces.reduce(0) { $0 + compartmentWidth(for: $1) } !=
+                self.workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
             renderedWorkspaces = self.workspaces
             forceLayoutRebuild = false
-            invalidateIntrinsicContentSize()
-            needsDisplay = true
+            if widthChanged { invalidateIntrinsicContentSize() }
+            if geometryChanged { needsDisplay = true }
             return
         }
 
@@ -649,17 +659,8 @@ private final class WorkspaceStripView: NSView {
                                                 onSelect: onSelect,
                                                 onFocusWindow: { [weak self] id in self?.focusWindow?(id) })
             let background: NSView
-            if CompanionPreferences.background == .glass {
-                let glass = PassthroughGlassEffectView(frame: frame)
-                glass.cornerRadius = 8 * scale
-                glass.tintColor = workspace.isFocused
-                    ? CompanionPreferences.accentColor.withAlphaComponent(0.26 * CompanionPreferences.backgroundOpacity)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.10 * CompanionPreferences.backgroundOpacity)
-                background = glass
-            } else {
-                background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
-                                                       style: CompanionPreferences.background)
-            }
+            background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
+                                                   style: CompanionPreferences.background)
             // Each island is an independent sibling over the continuous rail.
             // Its background never owns hit testing; only its own icon targets do.
             addSubview(background)
@@ -840,6 +841,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
+        button.isBordered = false
+        button.appearsDisabled = true
+        button.focusRingType = .none
         (button.cell as? NSButtonCell)?.highlightsBy = []
 
         let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: CompanionPreferences.size))
@@ -902,7 +906,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInteractive).async { [client = self.client] in client.focusWindow(id) }
             self.scheduleRefresh()
         })
-        statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
+        let desiredLength = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
+        if statusItem?.length != desiredLength { statusItem?.length = desiredLength }
     }
 
     private func refresh() {
