@@ -1,8 +1,7 @@
 import AppKit
-import SwiftUI
 
-private struct Workspace: Identifiable, Equatable {
-    let id: String
+private struct Workspace: Equatable {
+    let name: String
     let isFocused: Bool
     let bundleIDs: [String]
 }
@@ -27,6 +26,7 @@ private final class AeroSpaceClient {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+
         do {
             try process.run()
             let data = output.fileHandleForReading.readDataToEndOfFile()
@@ -40,8 +40,14 @@ private final class AeroSpaceClient {
 
     func snapshot() -> [Workspace]? {
         guard
-            let workspaceText = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
-            let windowText = run(["list-windows", "--all", "--format", "%{app-bundle-id}|%{workspace}"])
+            let workspaceText = run([
+                "list-workspaces", "--all", "--format",
+                "%{workspace}|%{workspace-is-focused}"
+            ]),
+            let windowText = run([
+                "list-windows", "--all", "--format",
+                "%{app-bundle-id}|%{workspace}"
+            ])
         else { return nil }
 
         var apps: [String: [String]] = [:]
@@ -57,26 +63,33 @@ private final class AeroSpaceClient {
             let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard let name = fields.first, !name.isEmpty else { return nil }
             return Workspace(
-                id: name,
+                name: name,
                 isFocused: fields.count > 1 && fields[1].trimmingCharacters(in: .whitespaces) == "true",
                 bundleIDs: apps[name, default: []]
             )
         }
     }
 
-    func focus(_ name: String) {
-        _ = run(["workspace", name])
+    func focus(_ workspace: String) {
+        _ = run(["workspace", workspace])
     }
 
     func subscribe(pipe: Pipe, onExit: @escaping () -> Void) throws -> Process {
         guard let executable else {
-            throw NSError(domain: "Companion.AeroSpace", code: 1)
+            throw NSError(
+                domain: "Companion.AeroSpace",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "AeroSpace CLI was not found"]
+            )
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = [
-            "subscribe", "focus-changed", "focused-workspace-changed",
-            "focused-monitor-changed", "window-detected"
+            "subscribe",
+            "focus-changed",
+            "focused-workspace-changed",
+            "focused-monitor-changed",
+            "window-detected"
         ]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
@@ -91,97 +104,186 @@ private final class AppIconCache {
     static let shared = AppIconCache()
     private let cache = NSCache<NSString, NSImage>()
 
-    private init() { cache.countLimit = 64 }
+    private init() {
+        cache.countLimit = 64
+    }
 
     func image(for bundleID: String) -> NSImage? {
         let key = bundleID as NSString
         if let image = cache.object(forKey: key) { return image }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
             return nil
         }
-        let image = NSWorkspace.shared.icon(forFile: url.path)
+        let image = NSWorkspace.shared.icon(forFile: appURL.path)
         image.size = NSSize(width: 15, height: 15)
         cache.setObject(image, forKey: key)
         return image
     }
 }
 
-private struct AppIcon: View {
-    let bundleID: String
-
-    var body: some View {
-        Group {
-            if let image = AppIconCache.shared.image(for: bundleID) {
-                Image(nsImage: image).resizable().interpolation(.high).scaledToFit()
-            } else {
-                Image(systemName: "app").resizable().scaledToFit()
-                    .foregroundStyle(.secondary).padding(2)
-            }
-        }
-        .frame(width: 15, height: 15)
-        .help(bundleID)
-    }
-}
-
-private struct WorkspaceCompartment: View {
+@MainActor
+private final class WorkspaceContentView: NSView {
     let workspace: Workspace
-    private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
+    let onSelect: (String) -> Void
+    private let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    private let countFont = NSFont.systemFont(ofSize: 9, weight: .medium)
+    private let iconSize: CGFloat = 15
+
+    init(workspace: Workspace, frame: NSRect, onSelect: @escaping (String) -> Void) {
+        self.workspace = workspace
+        self.onSelect = onSelect
+        super.init(frame: frame)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Workspace \(workspace.name), \(workspace.bundleIDs.count) applications")
     }
 
-    var body: some View {
-        HStack(spacing: 5) {
-            Text(workspace.id)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .monospaced()
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .frame(minWidth: 11)
-            HStack(spacing: 3) {
-                ForEach(workspace.bundleIDs.prefix(3), id: \.self) { AppIcon(bundleID: $0) }
-                if workspace.bundleIDs.count > 3 {
-                    Text("+\(workspace.bundleIDs.count - 3)")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let title = workspace.name as NSString
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: titleFont,
+            .foregroundColor: NSColor.labelColor
+        ]
+        let titleSize = title.size(withAttributes: titleAttributes)
+        let titleWidth = max(11, ceil(titleSize.width))
+        let titleRect = NSRect(
+            x: 7,
+            y: floor((bounds.height - titleSize.height) / 2),
+            width: titleWidth,
+            height: titleSize.height
+        )
+        title.draw(in: titleRect, withAttributes: titleAttributes)
+
+        var x = titleRect.maxX + (workspace.bundleIDs.isEmpty ? 0 : 5)
+        for bundleID in workspace.bundleIDs.prefix(3) {
+            if let icon = AppIconCache.shared.image(for: bundleID) {
+                icon.draw(
+                    in: NSRect(x: x, y: floor((bounds.height - iconSize) / 2),
+                               width: iconSize, height: iconSize),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1
+                )
             }
+            x += iconSize + 3
         }
-        .padding(.horizontal, 7)
-        .frame(height: 22)
-        .background {
-            shape.fill(workspace.isFocused
-                ? Color.accentColor.opacity(0.17)
-                : Color.primary.opacity(0.065))
-        }
-        .glassEffect(.regular, in: shape)
-        .overlay {
-            shape.strokeBorder(
-                workspace.isFocused ? Color.accentColor.opacity(0.52) : Color.primary.opacity(0.09),
-                lineWidth: 0.7
+
+        if workspace.bundleIDs.count > 3 {
+            x -= 3
+            let more = "+\(workspace.bundleIDs.count - 3)" as NSString
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: countFont,
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            let size = more.size(withAttributes: attributes)
+            more.draw(
+                in: NSRect(x: x + 2, y: floor((bounds.height - size.height) / 2),
+                           width: size.width, height: size.height),
+                withAttributes: attributes
             )
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Workspace \(workspace.id), \(workspace.bundleIDs.count) applications")
+
+        if workspace.isFocused {
+            let border = NSBezierPath(
+                roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                xRadius: 8.5,
+                yRadius: 8.5
+            )
+            NSColor.controlAccentColor.withAlphaComponent(0.42).setStroke()
+            border.lineWidth = 0.8
+            border.stroke()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onSelect(workspace.name)
     }
 }
 
-private struct WorkspaceStrip: View {
-    let workspaces: [Workspace]
-    let onSelect: (String) -> Void
+@MainActor
+private final class WorkspaceStripView: NSView {
+    private var workspaces: [Workspace] = []
+    private var glassContainer: NSGlassEffectContainerView?
+    private let height: CGFloat = 22
+    private let gap: CGFloat = 5
 
-    var body: some View {
-        HStack(spacing: 5) {
-            ForEach(workspaces) { workspace in
-                Button { onSelect(workspace.id) } label: {
-                    WorkspaceCompartment(workspace: workspace)
-                }
-                .buttonStyle(.plain)
-                .help("Switch to workspace \(workspace.id)")
-            }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: measuredWidth, height: height)
+    }
+
+    private var measuredWidth: CGFloat {
+        guard !workspaces.isEmpty else { return 1 }
+        return workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
+            + CGFloat(max(0, workspaces.count - 1)) * gap + 4
+    }
+
+    private func compartmentWidth(for workspace: Workspace) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let labelWidth = max(11, ceil((workspace.name as NSString).size(
+            withAttributes: [.font: font]
+        ).width))
+        let visibleIcons = min(3, workspace.bundleIDs.count)
+        var width: CGFloat = 14 + labelWidth
+        if visibleIcons > 0 {
+            width += 5 + CGFloat(visibleIcons) * 15 + CGFloat(visibleIcons - 1) * 3
         }
-        .padding(.horizontal, 2)
-        .frame(height: 22)
-        .fixedSize(horizontal: true, vertical: true)
+        if workspace.bundleIDs.count > 3 {
+            let more = "+\(workspace.bundleIDs.count - 3)" as NSString
+            let moreWidth = ceil(more.size(
+                withAttributes: [.font: NSFont.systemFont(ofSize: 9, weight: .medium)]
+            ).width)
+            width += 5 + moreWidth
+        }
+        if !workspace.bundleIDs.isEmpty { width = max(width, 44) }
+        return ceil(width)
+    }
+
+    func update(workspaces: [Workspace], onSelect: @escaping (String) -> Void) {
+        self.workspaces = workspaces
+        glassContainer?.removeFromSuperview()
+
+        let contentHost = NSView(frame: bounds)
+        contentHost.autoresizingMask = [.width, .height]
+        var x: CGFloat = 2
+
+        for workspace in workspaces {
+            let width = compartmentWidth(for: workspace)
+            let frame = NSRect(x: x, y: 0, width: width, height: height)
+            let glass = NSGlassEffectView(frame: frame)
+            glass.cornerRadius = 9
+            if workspace.isFocused {
+                glass.tintColor = NSColor.controlAccentColor.withAlphaComponent(0.20)
+            }
+
+            let content = WorkspaceContentView(
+                workspace: workspace,
+                frame: NSRect(origin: .zero, size: frame.size),
+                onSelect: onSelect
+            )
+            glass.contentView = content
+            contentHost.addSubview(glass)
+            x += width + gap
+        }
+
+        let container = NSGlassEffectContainerView(frame: bounds)
+        container.spacing = gap
+        container.autoresizingMask = [.width, .height]
+        container.contentView = contentHost
+        addSubview(container)
+        glassContainer = container
+
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
     }
 }
 
@@ -189,45 +291,42 @@ private struct WorkspaceStrip: View {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = AeroSpaceClient()
     private var statusItem: NSStatusItem?
-    private var host: NSHostingView<WorkspaceStrip>?
-    private var stream: Process?
-    private var streamPipe: Pipe?
-    private var buffer = ""
-    private var reconnect: DispatchWorkItem?
-    private var refreshTask: DispatchWorkItem?
-    private var workspaces: [Workspace] = []
-    private var stopping = false
+    private var strip: WorkspaceStripView?
+    private var eventProcess: Process?
+    private var eventPipe: Pipe?
+    private var eventBuffer = ""
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var refreshWorkItem: DispatchWorkItem?
+    private var currentWorkspaces: [Workspace] = []
+    private var isStopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: 1)
         statusItem = item
-
-        let view = NSHostingView(rootView: WorkspaceStrip(workspaces: []) { [weak self] name in
-            self?.client.focus(name)
-            self?.scheduleRefresh()
-        })
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
-        view.translatesAutoresizingMaskIntoConstraints = false
-        button.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: button.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: button.trailingAnchor),
-            view.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-            view.heightAnchor.constraint(equalToConstant: 22)
-        ])
-        host = view
 
-        let workspaceCenter = NSWorkspace.shared.notificationCenter
-        workspaceCenter.addObserver(
+        let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: 22))
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(strip)
+        NSLayoutConstraint.activate([
+            strip.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            strip.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+            strip.heightAnchor.constraint(equalToConstant: 22)
+        ])
+        self.strip = strip
+
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(
             self,
             selector: #selector(applicationLifecycleChanged(_:)),
             name: NSWorkspace.didLaunchApplicationNotification,
             object: nil
         )
-        workspaceCenter.addObserver(
+        center.addObserver(
             self,
             selector: #selector(applicationLifecycleChanged(_:)),
             name: NSWorkspace.didTerminateApplicationNotification,
@@ -235,7 +334,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         refresh()
-        startStream()
+        startEventStream()
     }
 
     @objc private func applicationLifecycleChanged(_ notification: Notification) {
@@ -243,95 +342,104 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        guard let latest = client.snapshot(), latest != workspaces else { return }
-        workspaces = latest
-        host?.rootView = WorkspaceStrip(workspaces: latest) { [weak self] name in
+        guard let latest = client.snapshot() else { return }
+        guard latest != currentWorkspaces else { return }
+        currentWorkspaces = latest
+        strip?.update(workspaces: latest) { [weak self] name in
             self?.client.focus(name)
             self?.scheduleRefresh()
         }
-        guard let host, let statusItem else { return }
-        let width = max(1, ceil(host.fittingSize.width))
-        statusItem.length = width
+        statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
     }
 
     private func scheduleRefresh() {
-        refreshTask?.cancel()
-        let task = DispatchWorkItem { [weak self] in self?.refresh() }
-        refreshTask = task
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: task)
+        refreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        refreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
-    private func startStream() {
-        guard !stopping, stream == nil else { return }
+    private func startEventStream() {
+        guard !isStopping, eventProcess == nil else { return }
         let pipe = Pipe()
         do {
             let process = try client.subscribe(pipe: pipe) { [weak self] in
-                DispatchQueue.main.async { self?.streamEnded() }
+                DispatchQueue.main.async { self?.eventStreamDidEnd() }
             }
-            streamPipe = pipe
-            stream = process
+            eventPipe = pipe
+            eventProcess = process
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                Task { @MainActor in self?.receive(text) }
+                Task { @MainActor in self?.consumeEvents(text) }
             }
         } catch {
             scheduleReconnect()
         }
     }
 
-    private func receive(_ text: String) {
-        buffer += text
-        while let end = buffer.firstIndex(of: "\n") {
-            let line = String(buffer[..<end])
-            buffer.removeSubrange(...end)
+    private func consumeEvents(_ text: String) {
+        eventBuffer += text
+        while let newline = eventBuffer.firstIndex(of: "\n") {
+            let line = String(eventBuffer[..<newline])
+            eventBuffer.removeSubrange(...newline)
             guard
                 let data = line.data(using: .utf8),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let event = object["_event"] as? String
             else { continue }
-            if ["focus-changed", "focused-workspace-changed",
-                "focused-monitor-changed", "window-detected"].contains(event) {
+
+            if [
+                "focus-changed",
+                "focused-workspace-changed",
+                "focused-monitor-changed",
+                "window-detected"
+            ].contains(event) {
                 scheduleRefresh()
             }
         }
     }
 
-    private func streamEnded() {
-        streamPipe?.fileHandleForReading.readabilityHandler = nil
-        streamPipe = nil
-        stream = nil
+    private func eventStreamDidEnd() {
+        eventPipe?.fileHandleForReading.readabilityHandler = nil
+        eventPipe = nil
+        eventProcess = nil
         scheduleReconnect()
     }
 
     private func scheduleReconnect() {
-        guard !stopping, reconnect == nil else { return }
-        let task = DispatchWorkItem { [weak self] in
+        guard !isStopping, reconnectWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.reconnect = nil
+            self.reconnectWorkItem = nil
             self.refresh()
-            self.startStream()
+            self.startEventStream()
         }
-        reconnect = task
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: task)
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        stopping = true
-        refreshTask?.cancel()
-        reconnect?.cancel()
-        streamPipe?.fileHandleForReading.readabilityHandler = nil
-        stream?.terminate()
-        stream = nil
-        streamPipe = nil
+        isStopping = true
+        refreshWorkItem?.cancel()
+        reconnectWorkItem?.cancel()
+        eventPipe?.fileHandleForReading.readabilityHandler = nil
+        eventProcess?.terminate()
+        eventProcess = nil
+        eventPipe = nil
     }
 }
 
 @main
-struct CompanionApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+private final class CompanionApplication: NSObject, NSApplicationDelegate {
+    private var delegate: AppDelegate?
 
-    var body: some Scene {
-        Settings { EmptyView() }
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        let applicationDelegate = CompanionApplication()
+        applicationDelegate.delegate = delegate
+        app.delegate = delegate
+        app.run()
     }
 }
