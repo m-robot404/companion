@@ -379,7 +379,12 @@ private final class PreferencesWindowController: NSObject {
         stack.addArrangedSubview(accentLabel)
         stack.addArrangedSubview(accent)
 
-        stack.addArrangedSubview(NSBox.separator())
+        let separator = NSView()
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        separator.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        stack.addArrangedSubview(separator)
         stack.addArrangedSubview(makeToggle("Show only occupied workspaces", key: "occupiedOnly", value: CompanionPreferences.occupiedOnly))
         stack.addArrangedSubview(makeToggle("Show app icons", key: "showIcons", value: CompanionPreferences.showIcons))
         stack.addArrangedSubview(makeToggle("Show workspace labels", key: "showLabels", value: CompanionPreferences.showLabels))
