@@ -518,6 +518,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                   let event = object["_event"] as? String else { continue }
             if ["focus-changed", "focused-workspace-changed", "focused-monitor-changed", "window-detected"].contains(event) {
                 scheduleRefresh()
+                // Closing a window can race AeroSpace's window-tree cleanup.
+                // Re-read after the close settles so stale app icons disappear.
+                if event == "focus-changed" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        self?.scheduleRefresh()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                        self?.scheduleRefresh()
+                    }
+                }
             }
         }
     }
