@@ -942,6 +942,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var eventBuffer = ""
     private var reconnectWorkItem: DispatchWorkItem?
     private var refreshWorkItem: DispatchWorkItem?
+    private var reconciliationWorkItem: DispatchWorkItem?
     private var currentWorkspaces: [Workspace] = []
     private var isRefreshing = false
     private var refreshPending = false
@@ -1046,6 +1047,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         stripHeightConstraint?.constant = CompanionPreferences.size
         strip?.invalidateWorkspaceLayout()
         renderWorkspaces()
+        updateWindowReconciliation()
     }
 
     @objc private func applicationLifecycleChanged(_ notification: Notification) { scheduleRefresh() }
@@ -1080,6 +1082,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     self.refreshPending = false
                     self.refresh()
                 }
+                self.updateWindowReconciliation()
             }
         }
     }
@@ -1089,6 +1092,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let work = DispatchWorkItem { [weak self] in self?.refresh() }
         refreshWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+    }
+
+    // AeroSpace does not expose a window-closed subscription event in its
+    // documented event set. Reconcile while icons are present so closing the
+    // final window on an otherwise-empty workspace cannot leave a stale icon.
+    // This timer stops as soon as the window list is empty or icons are disabled.
+    private func updateWindowReconciliation() {
+        let hasVisibleWindowIcons = CompanionPreferences.showIcons
+            && currentWorkspaces.contains { !$0.windows.isEmpty }
+        guard !isStopping, hasVisibleWindowIcons else {
+            reconciliationWorkItem?.cancel()
+            reconciliationWorkItem = nil
+            return
+        }
+        guard reconciliationWorkItem == nil else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconciliationWorkItem = nil
+            self.refresh()
+        }
+        reconciliationWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25, execute: work)
     }
 
     private func startEventStream() {
@@ -1155,6 +1181,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         isStopping = true
         refreshWorkItem?.cancel()
         reconnectWorkItem?.cancel()
+        reconciliationWorkItem?.cancel()
+        reconciliationWorkItem = nil
         eventPipe?.fileHandleForReading.readabilityHandler = nil
         eventProcess?.terminate()
         eventProcess = nil
