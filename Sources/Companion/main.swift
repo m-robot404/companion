@@ -1,7 +1,6 @@
 import AppKit
 import CoreGraphics
 import Darwin
-import ScreenCaptureKit
 
 // MARK: - Preferences
 
@@ -301,98 +300,10 @@ private final class AppIconCache {
 
 @MainActor
 private final class WorkspaceIconHitView: NSView {
-    var onEnter: ((NSView) -> Void)?
-    var onExit: (() -> Void)?
     var onPress: ((NSEvent) -> Void)?
     var onRightPress: ((NSEvent) -> Void)?
-    private var tracking: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { onEnter?(self) }
-    override func mouseExited(with event: NSEvent) { onExit?() }
     override func mouseDown(with event: NSEvent) { onPress?(event) }
     override func rightMouseDown(with event: NSEvent) { onRightPress?(event) }
-}
-
-// MARK: - Throttled ScreenCaptureKit Preview
-
-private actor WindowPreviewSource {
-    static let shared = WindowPreviewSource()
-    private var windowsByID: [CGWindowID: SCWindow] = [:]
-    private var refreshedAt = Date.distantPast
-    private var thumbnails: [CGWindowID: CGImage] = [:]
-    private var thumbnailOrder: [CGWindowID] = []
-    private let cacheLimit = 8
-
-    private func refreshWindowMap() async {
-        guard Date().timeIntervalSince(refreshedAt) >= 1.5 || windowsByID.isEmpty else { return }
-        guard let content = try? await SCShareableContent.excludingDesktopWindows(
-            false, onScreenWindowsOnly: false
-        ) else { return }
-        windowsByID = Dictionary(content.windows.map { ($0.windowID, $0) },
-                                 uniquingKeysWith: { _, latest in latest })
-        refreshedAt = Date()
-    }
-
-    func capture(_ window: WorkspaceWindow) async -> CGImage? {
-        let rawValue = window.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parsedID = rawValue.hasPrefix("0x")
-            ? UInt32(rawValue.dropFirst(2), radix: 16)
-            : UInt32(rawValue)
-        guard let rawID = parsedID else { return nil }
-        let id = CGWindowID(rawID)
-
-        if let cached = thumbnails[id] { return cached }
-        await refreshWindowMap()
-
-        var target = windowsByID[id]
-        if target == nil {
-            let candidates = windowsByID.values.filter {
-                $0.owningApplication?.bundleIdentifier == window.bundleID
-            }
-            if !window.title.isEmpty {
-                let titleMatches = candidates.filter { $0.title == window.title }
-                if titleMatches.count == 1 { target = titleMatches[0] }
-            }
-            if target == nil && candidates.count == 1 { target = candidates[0] }
-        }
-        guard let target else { return nil }
-
-        // Scaled to 240x135 to strictly minimize RAM usage
-        let sourceWidth = max(1, target.frame.width)
-        let sourceHeight = max(1, target.frame.height)
-        let scale = min(1, min(240 / sourceWidth, 135 / sourceHeight))
-        let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(sourceWidth * scale))
-        configuration.height = max(1, Int(sourceHeight * scale))
-        configuration.showsCursor = false
-        configuration.ignoreShadowsSingleWindow = true
-
-        do {
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: SCContentFilter(desktopIndependentWindow: target),
-                configuration: configuration
-            )
-            thumbnails[id] = image
-            thumbnailOrder.removeAll { $0 == id }
-            thumbnailOrder.append(id)
-            while thumbnailOrder.count > cacheLimit {
-                thumbnails[thumbnailOrder.removeFirst()] = nil
-            }
-            return image
-        } catch {
-            return nil
-        }
-    }
 }
 
 // MARK: - Workspace Content View
@@ -405,10 +316,6 @@ private final class WorkspaceContentView: NSView {
     let onAction: (String, String, WorkspaceWindow) -> Void
     let allWorkspaceNamesProvider: () -> [String]
 
-    private var previewPopover: NSPopover?
-    private weak var previewAnchor: NSView?
-    private var previewDismissWorkItem: DispatchWorkItem?
-    private var activePreviewTask: Task<Void, Never>?
     private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
@@ -527,15 +434,6 @@ private final class WorkspaceContentView: NSView {
         iconHitViews.removeAll()
         for (frame, group) in iconFrames() {
             let target = WorkspaceIconHitView(frame: frame)
-            target.onEnter = { [weak self] anchor in
-                self?.previewDismissWorkItem?.cancel()
-                self?.previewDismissWorkItem = nil
-                self?.showPreview(for: group, anchoredTo: anchor)
-            }
-            target.onExit = { [weak self, weak target] in
-                guard let self, self.previewAnchor === target else { return }
-                self.schedulePreviewDismissal()
-            }
             target.onPress = { [weak self] event in
                 self?.activate(group, event: event)
             }
@@ -551,7 +449,6 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func activate(_ group: AppGroup, event: NSEvent) {
-        closePreview()
         if group.windows.count == 1, let window = group.windows.first {
             onFocusWindow(window.id)
             return
@@ -568,7 +465,6 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func showWindowContextMenu(for group: AppGroup, event: NSEvent) {
-        closePreview()
         guard let window = group.windows.first else { return }
         let menu = NSMenu()
 
@@ -623,79 +519,7 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    func closePreview() {
-        activePreviewTask?.cancel()
-        activePreviewTask = nil
-        previewDismissWorkItem?.cancel()
-        previewDismissWorkItem = nil
-        previewPopover?.close()
-        previewPopover = nil
-        previewAnchor = nil
-    }
-
-    private func schedulePreviewDismissal() {
-        previewDismissWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.previewDismissWorkItem = nil
-            let pointer = NSEvent.mouseLocation
-            if let popWindow = self.previewPopover?.contentViewController?.view.window,
-               popWindow.frame.contains(pointer) {
-                return
-            }
-            self.closePreview()
-        }
-        previewDismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
-    }
-
-    private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
-        closePreview()
-        let popover = NSPopover()
-        popover.behavior = .applicationDefined
-        let controller = NSViewController()
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
-        host.wantsLayer = true
-        host.layer?.cornerRadius = 10
-
-        let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.image = AppIconCache.shared.image(for: group.bundleID, size: 48)
-        host.addSubview(imageView)
-
-        let title = NSTextField(labelWithString: group.windows[0].title)
-        title.frame = NSRect(x: 12, y: 10, width: 208, height: 20)
-        title.lineBreakMode = .byTruncatingMiddle
-        title.font = .systemFont(ofSize: 11, weight: .medium)
-        host.addSubview(title)
-
-        if group.windows.count > 1 {
-            let count = NSTextField(labelWithString: "\(group.windows.count) windows — click to choose")
-            count.frame = NSRect(x: 12, y: 26, width: 208, height: 12)
-            count.font = .systemFont(ofSize: 9)
-            count.textColor = .secondaryLabelColor
-            host.addSubview(count)
-        }
-
-        controller.view = host
-        popover.contentViewController = controller
-        popover.show(relativeTo: NSRect(x: anchor.bounds.midX - 2, y: anchor.bounds.midY, width: 4, height: 2),
-                     of: anchor, preferredEdge: .maxY)
-        previewAnchor = anchor
-        previewPopover = popover
-
-        // Asynchronously capture thumbnail with strict Task cancellation
-        activePreviewTask = Task { @MainActor [weak imageView] in
-            guard let imageView else { return }
-            let window = group.windows[0]
-            guard let image = await WindowPreviewSource.shared.capture(window),
-                  !Task.isCancelled else { return }
-            imageView.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-        }
-    }
-
     override func mouseDown(with event: NSEvent) {
-        closePreview()
         onSelect(workspace.name)
     }
 
@@ -861,7 +685,6 @@ private final class WorkspaceStripView: NSView {
         // View Diffing & Recycling: Update existing views in place
         let currentKeys = Set(self.workspaces.map { $0.name })
         for (name, view) in compartmentViews where !currentKeys.contains(name) {
-            view.closePreview()
             view.removeFromSuperview()
             compartmentViews.removeValue(forKey: name)
             backgroundViews[name]?.removeFromSuperview()
