@@ -207,12 +207,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.client.focus(name)
             self?.scheduleRefresh()
         })
-        view.frame = NSRect(x: 0, y: 0, width: 30, height: 22)
+        guard let button = item.button else { return }
+        button.title = ""
+        button.image = nil
+        view.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            view.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+            view.heightAnchor.constraint(equalToConstant: 22)
+        ])
         host = view
-        item.view = view
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(applicationLifecycleChanged(_:)),
+            name: NSWorkspace.didLaunchApplicationNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(applicationLifecycleChanged(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
 
         refresh()
         startStream()
+    }
+
+    @objc private func applicationLifecycleChanged(_ notification: Notification) {
+        scheduleRefresh()
     }
 
     private func refresh() {
@@ -224,7 +251,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let host, let statusItem else { return }
         let width = max(1, ceil(host.fittingSize.width))
-        host.frame = NSRect(x: 0, y: 0, width: width, height: 22)
         statusItem.length = width
     }
 
