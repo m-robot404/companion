@@ -2,6 +2,77 @@ import AppKit
 import CoreGraphics
 import Darwin
 import ScreenCaptureKit
+import ServiceManagement
+
+
+// MARK: - Crash recording
+// Writes a compact crash marker to ~/Library/Logs/Companion/crash.log.
+// macOS DiagnosticReports remain the source for full crash stacks.
+private enum CrashRecorder {
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Companion", isDirectory: true)
+    static let logURL = directory.appendingPathComponent("crash.log")
+
+    static func install() {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+               let size = attributes[.size] as? NSNumber, size.intValue > 512 * 1024 {
+                try FileManager.default.removeItem(at: logURL)
+            }
+            let descriptor = Darwin.open(logURL.path, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { return }
+            crashLogDescriptor = descriptor
+            append("Session started: \\(ISO8601DateFormatter().string(from: Date()))\\n")
+            NSSetUncaughtExceptionHandler(companionExceptionHandler)
+            signal(SIGABRT, companionSignalHandler)
+            signal(SIGILL, companionSignalHandler)
+            signal(SIGSEGV, companionSignalHandler)
+            signal(SIGBUS, companionSignalHandler)
+            signal(SIGFPE, companionSignalHandler)
+        } catch {
+            NSLog("Companion: could not initialize crash recording: %@", error.localizedDescription)
+        }
+    }
+
+    static func append(_ message: String) {
+        guard crashLogDescriptor >= 0 else { return }
+        let data = Data(message.utf8)
+        data.withUnsafeBytes { bytes in
+            if let base = bytes.baseAddress { _ = Darwin.write(crashLogDescriptor, base, bytes.count) }
+        }
+    }
+
+    static func record(_ exception: NSException) {
+        let stack = exception.callStackSymbols.joined(separator: "\\n")
+        append("\\nUNCAUGHT EXCEPTION: \\(exception.name.rawValue)\\nReason: \\(exception.reason ?? "unknown")\\n\\(stack)\\n")
+    }
+}
+
+private var crashLogDescriptor: Int32 = -1
+private let signalCrashMessages: [Int32: [CChar]] = [
+    SIGABRT: Array("FATAL SIGNAL: SIGABRT\\n".utf8CString),
+    SIGILL: Array("FATAL SIGNAL: SIGILL\\n".utf8CString),
+    SIGSEGV: Array("FATAL SIGNAL: SIGSEGV\\n".utf8CString),
+    SIGBUS: Array("FATAL SIGNAL: SIGBUS\\n".utf8CString),
+    SIGFPE: Array("FATAL SIGNAL: SIGFPE\\n".utf8CString)
+]
+
+private func companionExceptionHandler(_ exception: NSException) {
+    CrashRecorder.record(exception)
+}
+
+private func companionSignalHandler(_ signalNumber: Int32) {
+    if crashLogDescriptor >= 0, let message = signalCrashMessages[signalNumber] {
+        message.withUnsafeBufferPointer { buffer in
+            if let base = buffer.baseAddress {
+                _ = Darwin.write(crashLogDescriptor, base, buffer.count - 1)
+            }
+        }
+    }
+    Darwin.signal(signalNumber, SIG_DFL)
+    Darwin.raise(signalNumber)
+}
 
 private enum CompanionPreferences {
     enum Background: String, CaseIterable {
@@ -849,9 +920,10 @@ private final class SystemStatsPopoverController: NSObject {
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let client = AeroSpaceClient()
     private var statusItem: NSStatusItem?
+    private weak var openAtLoginItem: NSMenuItem?
     private var strip: WorkspaceStripView?
     private var statsPopoverController: SystemStatsPopoverController?
     private var stripHeightConstraint: NSLayoutConstraint?
@@ -866,6 +938,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isStopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CrashRecorder.install()
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: 1)
         item.autosaveName = "com.m-robot404.Companion.workspaceStrip"
@@ -913,10 +986,50 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
+
+        let loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleOpenAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        openAtLoginItem = loginItem
+        menu.addItem(loginItem)
+
+        let logsItem = NSMenuItem(title: "Open Crash Logs", action: #selector(openCrashLogs), keyEquivalent: "")
+        logsItem.target = self
+        menu.addItem(logsItem)
+
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit Companion", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
         return menu
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        openAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func toggleOpenAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            openAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } catch {
+            NSApp.presentError(error)
+        }
+    }
+
+    @objc private func openCrashLogs() {
+        do {
+            try FileManager.default.createDirectory(at: CrashRecorder.directory,
+                                                    withIntermediateDirectories: true)
+            NSWorkspace.shared.open(CrashRecorder.directory)
+        } catch {
+            NSApp.presentError(error)
+        }
     }
 
     @objc private func preferencesChanged() {
