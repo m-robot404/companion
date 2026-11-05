@@ -13,7 +13,7 @@ A small native macOS menu-bar companion for AeroSpace. It adds a compact workspa
 ## Implementation
 
 - Native Swift, SwiftUI, and AppKit; no third-party runtime dependencies.
-- Uses an `NSStatusItem` custom view in the existing system menu bar.
+- Hosts the compact SwiftUI strip inside the supported `NSStatusItem` button in the existing system menu bar.
 - Reads workspace/window state from the AeroSpace CLI.
 - Uses AeroSpace's `subscribe` event stream for focus, workspace, monitor, and newly detected window changes. The stream reconnects if AeroSpace restarts.
 - Caches application icons with a bounded in-memory cache.
@@ -38,4 +38,4 @@ GitHub Actions builds the app on an Apple Silicon macOS 26 runner and uploads a 
 
 ## Current validation status
 
-The repository contains the first implementation. The CI build and live behavior still need to pass validation before this should be treated as a release.
+The event-driven implementation has passed the macOS 26 Apple Silicon CI build, app-bundle validation, and code-signature verification. Runtime behavior and memory use still need measurement on a real Mac before calling it a fully validated release.
