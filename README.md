@@ -9,6 +9,7 @@ A small native macOS menu-bar companion for AeroSpace. It adds a compact workspa
 - Restrained active-workspace treatment using the macOS glass material.
 - Click a compartment to switch to that AeroSpace workspace.
 - Up to three app icons per compartment, followed by a count when more apps are present.
+- A compact menu-bar controls item opens Preferences, About, and Quit.
 
 ## Implementation
 
@@ -17,6 +18,8 @@ A small native macOS menu-bar companion for AeroSpace. It adds a compact workspa
 - Reads workspace/window state from the AeroSpace CLI.
 - Uses AeroSpace's `subscribe` event stream for focus, workspace, monitor, and newly detected window changes. The stream reconnects if AeroSpace restarts.
 - Caches application icons with a bounded in-memory cache.
+- Preferences persist strip size, glass/solid/transparent background, accent color, occupied-only filtering, app-icon visibility, and workspace-label visibility.
+- Includes a generated native macOS app icon in the app bundle.
 - No continuous polling loop.
 
 ## Requirements
