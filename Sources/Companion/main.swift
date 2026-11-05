@@ -30,6 +30,7 @@ private enum CrashRecorder {
             signal(SIGSEGV, companionSignalHandler)
             signal(SIGBUS, companionSignalHandler)
             signal(SIGFPE, companionSignalHandler)
+            signal(SIGTRAP, companionSignalHandler)
         } catch {
             NSLog("Companion: could not initialize crash recording: %@", error.localizedDescription)
         }
@@ -55,7 +56,8 @@ private let signalCrashMessages: [Int32: [CChar]] = [
     SIGILL: Array("FATAL SIGNAL: SIGILL\\n".utf8CString),
     SIGSEGV: Array("FATAL SIGNAL: SIGSEGV\\n".utf8CString),
     SIGBUS: Array("FATAL SIGNAL: SIGBUS\\n".utf8CString),
-    SIGFPE: Array("FATAL SIGNAL: SIGFPE\\n".utf8CString)
+    SIGFPE: Array("FATAL SIGNAL: SIGFPE\\n".utf8CString),
+    SIGTRAP: Array("FATAL SIGNAL: SIGTRAP\\n".utf8CString)
 ]
 
 private func companionExceptionHandler(_ exception: NSException) {
