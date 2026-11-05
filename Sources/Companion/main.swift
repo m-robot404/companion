@@ -481,8 +481,6 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
-        previewDismissWorkItem?.cancel()
-        previewDismissWorkItem = nil
         previewPopover?.close()
         previewPopover = nil
         let popover = NSPopover()
@@ -654,7 +652,6 @@ private final class WorkspaceStripView: NSView {
             if CompanionPreferences.background == .glass {
                 let glass = PassthroughGlassEffectView(frame: frame)
                 glass.cornerRadius = 8 * scale
-                glass.effectIsInteractive = false
                 glass.tintColor = workspace.isFocused
                     ? CompanionPreferences.accentColor.withAlphaComponent(0.26 * CompanionPreferences.backgroundOpacity)
                     : NSColor.controlBackgroundColor.withAlphaComponent(0.10 * CompanionPreferences.backgroundOpacity)
@@ -839,12 +836,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: 1)
         item.autosaveName = "com.m-robot404.Companion.workspaceStrip"
-        item.highlightMode = false
         statusItem = item
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
-        button.cell?.highlightsBy = []
+        (button.cell as? NSButtonCell)?.highlightsBy = []
 
         let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: CompanionPreferences.size))
         strip.translatesAutoresizingMaskIntoConstraints = false
