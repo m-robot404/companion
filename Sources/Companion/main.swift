@@ -509,6 +509,11 @@ private final class WorkspaceStripView: NSView {
                 background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
                                                        style: CompanionPreferences.background)
             }
+            // Position the interactive view in the same strip coordinates as its
+            // background. Leaving its origin at zero stacks every workspace's hit
+            // targets over the first compartment.
+            content.frame = frame
+            content.autoresizingMask = [.height]
             // Backgrounds are non-interactive siblings. Each icon hit target remains
             // independent instead of being swallowed by a glass container's hit area.
             contentHost.addSubview(background)
