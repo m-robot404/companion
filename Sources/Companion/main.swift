@@ -2,6 +2,87 @@ import AppKit
 import CoreGraphics
 import Darwin
 import ScreenCaptureKit
+import ServiceManagement
+
+
+// MARK: - Crash recording
+// Writes a compact crash marker to ~/Library/Logs/Companion/crash.log.
+// macOS DiagnosticReports remain the source for full native crash stacks.
+private enum CrashRecorder {
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Companion", isDirectory: true)
+    static let logURL = directory.appendingPathComponent("crash.log")
+
+    static func install() {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+               let size = attributes[.size] as? NSNumber, size.intValue > 512 * 1024 {
+                try FileManager.default.removeItem(at: logURL)
+            }
+            let descriptor = Darwin.open(logURL.path, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { return }
+            crashLogDescriptor = descriptor
+            append("Session started: \(ISO8601DateFormatter().string(from: Date()))\n")
+            NSSetUncaughtExceptionHandler(companionExceptionHandler)
+            signal(SIGABRT, companionSignalHandler)
+            signal(SIGILL, companionSignalHandler)
+            signal(SIGSEGV, companionSignalHandler)
+            signal(SIGBUS, companionSignalHandler)
+            signal(SIGFPE, companionSignalHandler)
+            signal(SIGTRAP, companionSignalHandler)
+        } catch {
+            NSLog("Companion: could not initialize crash recording: %@", error.localizedDescription)
+        }
+    }
+
+    static func append(_ message: String) {
+        guard crashLogDescriptor >= 0 else { return }
+        let data = Data(message.utf8)
+        data.withUnsafeBytes { bytes in
+            if let base = bytes.baseAddress { _ = Darwin.write(crashLogDescriptor, base, bytes.count) }
+        }
+    }
+
+    static func record(_ exception: NSException) {
+        let stack = exception.callStackSymbols.joined(separator: "\n")
+        append("\nUNCAUGHT EXCEPTION: \(exception.name.rawValue)\nReason: \(exception.reason ?? "unknown")\n\(stack)\n")
+    }
+}
+
+private var crashLogDescriptor: Int32 = -1
+private let sigabrtMessage = Array("FATAL SIGNAL: SIGABRT\n".utf8CString)
+private let sigillMessage = Array("FATAL SIGNAL: SIGILL\n".utf8CString)
+private let sigsegvMessage = Array("FATAL SIGNAL: SIGSEGV\n".utf8CString)
+private let sigbusMessage = Array("FATAL SIGNAL: SIGBUS\n".utf8CString)
+private let sigfpeMessage = Array("FATAL SIGNAL: SIGFPE\n".utf8CString)
+private let sigtrapMessage = Array("FATAL SIGNAL: SIGTRAP\n".utf8CString)
+
+private func companionExceptionHandler(_ exception: NSException) {
+    CrashRecorder.record(exception)
+}
+
+private func companionSignalHandler(_ signalNumber: Int32) {
+    let message: [CChar]
+    switch signalNumber {
+    case SIGABRT: message = sigabrtMessage
+    case SIGILL: message = sigillMessage
+    case SIGSEGV: message = sigsegvMessage
+    case SIGBUS: message = sigbusMessage
+    case SIGFPE: message = sigfpeMessage
+    case SIGTRAP: message = sigtrapMessage
+    default: message = sigabrtMessage
+    }
+    if crashLogDescriptor >= 0 {
+        message.withUnsafeBufferPointer { buffer in
+            if let base = buffer.baseAddress {
+                _ = Darwin.write(crashLogDescriptor, base, buffer.count - 1)
+            }
+        }
+    }
+    Darwin.signal(signalNumber, SIG_DFL)
+    Darwin.raise(signalNumber)
+}
 
 private enum CompanionPreferences {
     enum Background: String, CaseIterable {
@@ -117,11 +198,25 @@ private final class AeroSpaceClient {
     }
 
     func snapshot() -> [Workspace]? {
-        guard
-            let workspaceText = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
-            let windowText = run(["list-windows", "--all", "--format",
+        let group = DispatchGroup()
+        let resultLock = NSLock()
+        var workspaceText: String?
+        var windowText: String?
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = self.run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"])
+            resultLock.lock(); workspaceText = value; resultLock.unlock()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = self.run(["list-windows", "--all", "--format",
                                   "%{window-id}%{tab}%{app-bundle-id}%{tab}%{app-name}%{tab}%{window-title}%{tab}%{workspace}"])
-        else { return nil }
+            resultLock.lock(); windowText = value; resultLock.unlock()
+            group.leave()
+        }
+        group.wait()
+        guard let workspaceText, let windowText else { return nil }
 
         var windows: [String: [WorkspaceWindow]] = [:]
         for line in windowText.split(whereSeparator: \.isNewline) {
@@ -173,8 +268,11 @@ private final class AppIconCache {
     func image(for bundleID: String, size: CGFloat) -> NSImage? {
         let key = "\(bundleID)-\(Int(size))" as NSString
         if let image = cache.object(forKey: key) { return image }
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
-        let image = NSWorkspace.shared.icon(forFile: appURL.path)
+        // These icons belong to apps with live AeroSpace windows. Read the
+        // already-running application's icon directly instead of performing a
+        // synchronous LaunchServices URL lookup during menu-bar drawing.
+        guard let image = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.icon
+        else { return nil }
         image.size = NSSize(width: size, height: size)
         cache.setObject(image, forKey: key)
         return image
@@ -212,8 +310,10 @@ private actor WindowPreviewSource {
     private var windowsByID: [CGWindowID: SCWindow] = [:]
     private var refreshedAt = Date.distantPast
     private var thumbnails: [CGWindowID: CGImage] = [:]
+    private var thumbnailDates: [CGWindowID: Date] = [:]
     private var thumbnailOrder: [CGWindowID] = []
-    private let cacheLimit = 24
+    private let cacheLimit = 12
+    private let thumbnailFreshness: TimeInterval = 2.5
 
     private func refreshWindowMap() async {
         guard Date().timeIntervalSince(refreshedAt) >= 1 || windowsByID.isEmpty else { return }
@@ -248,11 +348,17 @@ private actor WindowPreviewSource {
             if target == nil && candidates.count == 1 { target = candidates[0] }
         }
         guard let target else { return nil }
-        if !target.isOnScreen, let cached = thumbnails[id] { return cached }
+        if let cached = thumbnails[id],
+           let capturedAt = thumbnailDates[id],
+           Date().timeIntervalSince(capturedAt) < thumbnailFreshness {
+            return cached
+        }
 
         let sourceWidth = max(1, target.frame.width)
         let sourceHeight = max(1, target.frame.height)
-        let scale = min(1, min(480 / sourceWidth, 270 / sourceHeight))
+        // Small menu-bar previews do not need retina-sized captures. A strict 240×135
+        // cap and 12-entry LRU bound keep capture and retained image memory low.
+        let scale = min(1, min(240 / sourceWidth, 135 / sourceHeight))
         let configuration = SCStreamConfiguration()
         configuration.width = max(1, Int(sourceWidth * scale))
         configuration.height = max(1, Int(sourceHeight * scale))
@@ -265,10 +371,13 @@ private actor WindowPreviewSource {
                 configuration: configuration
             )
             thumbnails[id] = image
+            thumbnailDates[id] = Date()
             thumbnailOrder.removeAll { $0 == id }
             thumbnailOrder.append(id)
             while thumbnailOrder.count > cacheLimit {
-                thumbnails[thumbnailOrder.removeFirst()] = nil
+                let evicted = thumbnailOrder.removeFirst()
+                thumbnails[evicted] = nil
+                thumbnailDates[evicted] = nil
             }
             return image
         } catch {
@@ -278,33 +387,14 @@ private actor WindowPreviewSource {
 }
 
 @MainActor
-private final class PreviewHoverHostView: NSView {
-    var onEnter: (() -> Void)?
-    var onExit: (() -> Void)?
-    private var tracking: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { onEnter?() }
-    override func mouseExited(with event: NSEvent) { onExit?() }
-}
-
-@MainActor
 private final class WorkspaceContentView: NSView {
-    let workspace: Workspace
+    var workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
-    private var previewPopover: NSPopover?
+    private var previewPanel: NSPanel?
     private weak var previewAnchor: NSView?
-    private var previewDismissWorkItem: DispatchWorkItem?
+    private weak var previewImageView: NSImageView?
+    private var previewTask: Task<Void, Never>?
     private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
@@ -316,9 +406,17 @@ private final class WorkspaceContentView: NSView {
         super.init(frame: frame)
         setAccessibilityRole(.button)
         setAccessibilityLabel("Workspace \(workspace.name), \(workspace.windows.count) windows")
-        installIconHitTargets()
+        refreshIconHitTargets()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func updateWorkspace(_ updated: Workspace) {
+        workspace = updated
+        refreshIconHitTargets()
+        setAccessibilityLabel("Workspace \(updated.name), \(updated.windows.count) windows")
+        needsDisplay = true
+    }
+
     override var isFlipped: Bool { true }
 
     private var scale: CGFloat { CompanionPreferences.size / 22 }
@@ -404,19 +502,36 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    private func installIconHitTargets() {
-        iconHitViews.forEach { $0.removeFromSuperview() }
-        iconHitViews.removeAll()
-        for (frame, group) in iconFrames() {
-            let target = WorkspaceIconHitView(frame: frame)
+    private func refreshIconHitTargets() {
+        let items = iconFrames()
+        if iconHitViews.count > items.count {
+            for target in iconHitViews.suffix(iconHitViews.count - items.count) {
+                target.removeFromSuperview()
+            }
+            iconHitViews.removeLast(iconHitViews.count - items.count)
+        }
+
+        for (index, item) in items.enumerated() {
+            let (frame, group) = item
+            let target: WorkspaceIconHitView
+            if index < iconHitViews.count {
+                target = iconHitViews[index]
+                target.frame = frame
+            } else {
+                target = WorkspaceIconHitView(frame: frame)
+                addSubview(target)
+                iconHitViews.append(target)
+            }
+
+            // Rebind the latest group data without replacing the tracking view.
+            // Recreating a tracking view under a stationary pointer emits exit/enter
+            // events and makes the preview repeatedly close and reopen.
             target.onEnter = { [weak self] anchor in
-                self?.previewDismissWorkItem?.cancel()
-                self?.previewDismissWorkItem = nil
                 self?.showPreview(for: group, anchoredTo: anchor)
             }
             target.onExit = { [weak self, weak target] in
                 guard let self, self.previewAnchor === target else { return }
-                self.schedulePreviewDismissal()
+                self.hidePreview()
             }
             target.onPress = { [weak self] event in
                 self?.activate(group, event: event)
@@ -424,15 +539,11 @@ private final class WorkspaceContentView: NSView {
             target.setAccessibilityRole(.button)
             target.setAccessibilityLabel(group.windows.count == 1
                 ? group.appName : "\(group.appName), \(group.windows.count) windows")
-            addSubview(target)
-            iconHitViews.append(target)
         }
     }
 
     private func activate(_ group: AppGroup, event: NSEvent) {
-        previewPopover?.close()
-        previewPopover = nil
-        previewAnchor = nil
+        hidePreview()
         if group.windows.count == 1, let window = group.windows.first {
             onFocusWindow(window.id)
             return
@@ -448,54 +559,32 @@ private final class WorkspaceContentView: NSView {
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    private func schedulePreviewDismissal() {
-        previewDismissWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.previewDismissWorkItem = nil
-            let pointer = NSEvent.mouseLocation
-            if self.previewPopover?.contentViewController?.view.window?.frame.contains(pointer) == true {
-                return
-            }
-            self.previewPopover?.close()
-            self.previewPopover = nil
-            self.previewAnchor = nil
-            self.previewDismissWorkItem = nil
-        }
-        previewDismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
-    }
-
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
-        previewDismissWorkItem?.cancel()
-        previewDismissWorkItem = nil
-        previewPopover?.close()
-        previewPopover = nil
-        let popover = NSPopover()
-        popover.behavior = .applicationDefined
-        let controller = NSViewController()
-        let host = PreviewHoverHostView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
-        host.onEnter = { [weak self] in
-            self?.previewDismissWorkItem?.cancel()
-            self?.previewDismissWorkItem = nil
-        }
-        host.onExit = { [weak self] in self?.schedulePreviewDismissal() }
+        guard let window = group.windows.first else { return }
+        if previewAnchor === anchor, previewPanel?.isVisible == true { return }
+        hidePreview()
+
+        // A mouse-transparent panel avoids NSPopover's tracking/close cycle at
+        // the lower edge of the menu bar. It never participates in hover hit-testing.
+        let width: CGFloat = 232
+        let height: CGFloat = 156
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.97).cgColor
         host.layer?.cornerRadius = 10
+        host.layer?.masksToBounds = true
+
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.image = AppIconCache.shared.image(for: group.bundleID, size: 64)
-        Task { @MainActor [weak self, weak imageView] in
-            guard let self, let imageView,
-                  let captured = await self.previewImage(for: group.windows[0]) else { return }
-            imageView.image = captured
-        }
         host.addSubview(imageView)
-        let title = NSTextField(labelWithString: group.windows[0].title)
+
+        let title = NSTextField(labelWithString: window.title.isEmpty ? group.appName : window.title)
         title.frame = NSRect(x: 12, y: 10, width: 208, height: 20)
         title.lineBreakMode = .byTruncatingMiddle
         title.font = .systemFont(ofSize: 11, weight: .medium)
         host.addSubview(title)
+
         if group.windows.count > 1 {
             let count = NSTextField(labelWithString: "\(group.windows.count) windows — click to choose")
             count.frame = NSRect(x: 12, y: 26, width: 208, height: 12)
@@ -503,13 +592,47 @@ private final class WorkspaceContentView: NSView {
             count.textColor = .secondaryLabelColor
             host.addSubview(count)
         }
-        controller.view = host
-        popover.contentViewController = controller
-        popover.show(relativeTo: NSRect(x: anchor.bounds.midX - 2, y: anchor.bounds.midY,
-                                        width: 4, height: 2),
-                     of: anchor, preferredEdge: .maxY)
+
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentView = host
+
+        if let window = anchor.window {
+            let anchorRect = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+            panel.setFrameOrigin(NSPoint(x: anchorRect.midX - width / 2,
+                                         y: anchorRect.minY - height - 4))
+        }
+
         previewAnchor = anchor
-        previewPopover = popover
+        previewImageView = imageView
+        previewPanel = panel
+        panel.orderFrontRegardless()
+
+        // Show the cached app icon immediately; capture and replace it asynchronously.
+        previewTask = Task { @MainActor [weak self, weak imageView, weak anchor] in
+            guard let self, let imageView, let anchor,
+                  let captured = await self.previewImage(for: window),
+                  !Task.isCancelled, self.previewAnchor === anchor else { return }
+            imageView.image = captured
+        }
+    }
+
+    private func hidePreview() {
+        previewTask?.cancel()
+        previewTask = nil
+        previewPanel?.orderOut(nil)
+        previewPanel = nil
+        previewImageView = nil
+        previewAnchor = nil
     }
 
     private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
@@ -518,9 +641,7 @@ private final class WorkspaceContentView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        previewPopover?.close()
-        previewPopover = nil
-        previewAnchor = nil
+        hidePreview()
         onSelect(workspace.name)
     }
 
@@ -533,10 +654,16 @@ private final class WorkspaceContentView: NSView {
 @MainActor
 private final class WorkspaceStripView: NSView {
     private var workspaces: [Workspace] = []
-    private var glassContainer: NSGlassEffectContainerView?
     private var selection: ((String) -> Void)?
-    private var compartmentViews: [NSView] = []
+    private var focusWindow: ((String) -> Void)?
+    private var contentViews: [WorkspaceContentView] = []
+    private var workspaceBackgrounds: [NSView] = []
+    private var renderedWorkspaces: [Workspace] = []
+    private var railBase: RailBaseView?
+    private var forceLayoutRebuild = false
     var contextMenu: NSMenu?
+
+    func invalidateWorkspaceLayout() { forceLayoutRebuild = true }
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: measuredWidth, height: CompanionPreferences.size)
@@ -547,11 +674,12 @@ private final class WorkspaceStripView: NSView {
         NSMenu.popUpContextMenu(contextMenu, with: event, for: self)
     }
 
-    private var gap: CGFloat { CompanionPreferences.workspaceSpacing * CompanionPreferences.size / 22 }
+    private var gap: CGFloat { max(5, CompanionPreferences.workspaceSpacing * CompanionPreferences.size / 22) }
+
     private var measuredWidth: CGFloat {
         guard !workspaces.isEmpty else { return 1 }
         return workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
-            + CGFloat(max(0, workspaces.count - 1)) * gap + 4
+            + CGFloat(max(0, workspaces.count - 1)) * gap + 12
     }
 
     private func compartmentWidth(for workspace: Workspace) -> CGFloat {
@@ -572,11 +700,9 @@ private final class WorkspaceStripView: NSView {
                 ]).width)
             }
         }
-        if !workspace.windows.isEmpty { width = max(width, 44 * scale) }
-        return ceil(max(24 * scale, width))
+        if !workspace.windows.isEmpty { width = max(width, 36 * scale) }
+        return ceil(max(22 * scale, width))
     }
-
-    private var focusWindow: ((String) -> Void)?
 
     func update(workspaces: [Workspace], onSelect: @escaping (String) -> Void,
                 onFocusWindow: @escaping (String) -> Void) {
@@ -585,50 +711,92 @@ private final class WorkspaceStripView: NSView {
             : workspaces
         selection = onSelect
         focusWindow = onFocusWindow
-        glassContainer?.removeFromSuperview()
-        glassContainer = nil
-        compartmentViews.forEach { $0.removeFromSuperview() }
-        compartmentViews.removeAll()
+
+        let sameStructure = !forceLayoutRebuild &&
+            renderedWorkspaces.count == self.workspaces.count &&
+            renderedWorkspaces.map(\.name) == self.workspaces.map(\.name)
+        if sameStructure && contentViews.count == self.workspaces.count {
+            let height = CompanionPreferences.size
+            let scale = height / 22
+            var x: CGFloat = 6
+            var geometryChanged = false
+            for index in self.workspaces.indices {
+                let workspace = self.workspaces[index]
+                let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
+                if contentViews[index].frame != frame {
+                    contentViews[index].frame = frame
+                    workspaceBackgrounds[index].frame = frame
+                    geometryChanged = true
+                }
+                if renderedWorkspaces[index] != workspace {
+                    contentViews[index].updateWorkspace(workspace)
+                    if let background = workspaceBackgrounds[index] as? CompartmentBackgroundView {
+                        background.updateFocus(workspace.isFocused)
+                    }
+                }
+                x += frame.width + gap
+            }
+            let railFrame = NSRect(x: 0, y: 3 * scale,
+                                   width: measuredWidth, height: height - 6 * scale)
+            if let railBase, railBase.frame != railFrame {
+                railBase.frame = railFrame
+                geometryChanged = true
+            }
+            let widthChanged = renderedWorkspaces.isEmpty ||
+                renderedWorkspaces.reduce(0) { $0 + compartmentWidth(for: $1) } !=
+                self.workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
+            renderedWorkspaces = self.workspaces
+            forceLayoutRebuild = false
+            if widthChanged { invalidateIntrinsicContentSize() }
+            if geometryChanged { needsDisplay = true }
+            return
+        }
+
+        forceLayoutRebuild = false
+        subviews.forEach { $0.removeFromSuperview() }
+        contentViews.removeAll()
+        workspaceBackgrounds.removeAll()
+        railBase = nil
 
         let height = CompanionPreferences.size
         let scale = height / 22
-        let contentHost = NSView(frame: NSRect(x: 0, y: 0, width: measuredWidth, height: height))
-        var x: CGFloat = 2
+        let base = RailBaseView(frame: NSRect(x: 0, y: 3 * scale,
+                                               width: measuredWidth, height: height - 6 * scale))
+        addSubview(base, positioned: .below, relativeTo: nil)
+        railBase = base
 
+        var x: CGFloat = 6
         for workspace in self.workspaces {
             let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
-            let content = WorkspaceContentView(workspace: workspace, frame: NSRect(origin: .zero, size: frame.size),
+            let content = WorkspaceContentView(workspace: workspace, frame: frame,
                                                 onSelect: onSelect,
                                                 onFocusWindow: { [weak self] id in self?.focusWindow?(id) })
             let background: NSView
-            if CompanionPreferences.background == .glass {
-                let glass = PassthroughGlassEffectView(frame: frame)
-                glass.cornerRadius = 9 * scale
-                glass.tintColor = workspace.isFocused
-                    ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
-                background = glass
-            } else {
-                background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
-                                                       style: CompanionPreferences.background)
-            }
-            // Position the interactive view in the same strip coordinates as its
-            // background. Leaving its origin at zero stacks every workspace's hit
-            // targets over the first compartment.
-            content.frame = frame
-            content.autoresizingMask = [.height]
-            // Backgrounds are non-interactive siblings. Each icon hit target remains
-            // independent instead of being swallowed by a glass container's hit area.
-            contentHost.addSubview(background)
-            contentHost.addSubview(content)
-            compartmentViews.append(background)
+            background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
+                                                   style: CompanionPreferences.background)
+            // Each island is an independent sibling over the continuous rail.
+            // Its background never owns hit testing; only its own icon targets do.
+            addSubview(background)
+            addSubview(content)
+            contentViews.append(content)
+            workspaceBackgrounds.append(background)
             x += frame.width + gap
         }
 
-        addSubview(contentHost)
-        compartmentViews.append(contentHost);
+        renderedWorkspaces = self.workspaces
         invalidateIntrinsicContentSize()
         needsDisplay = true
+    }
+}
+
+@MainActor
+private final class RailBaseView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        let radius = bounds.height / 2
+        let path = NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius)
+        NSColor.controlBackgroundColor.withAlphaComponent(0.18).setFill()
+        path.fill()
     }
 }
 
@@ -639,7 +807,7 @@ private final class PassthroughGlassEffectView: NSGlassEffectView {
 
 @MainActor
 private final class CompartmentBackgroundView: NSView {
-    private let focused: Bool
+    private var focused: Bool
     private let style: CompanionPreferences.Background
     init(frame: NSRect, focused: Bool, style: CompanionPreferences.Background) {
         self.focused = focused
@@ -648,15 +816,27 @@ private final class CompartmentBackgroundView: NSView {
         wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func updateFocus(_ value: Bool) {
+        guard focused != value else { return }
+        focused = value
+        needsDisplay = true
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
                                 xRadius: 9 * CompanionPreferences.size / 22,
                                 yRadius: 9 * CompanionPreferences.size / 22)
-        if style == .solid {
+        switch style {
+        case .glass:
+            (focused ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
+                     : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)).setFill()
+            path.fill()
+        case .solid:
             (focused ? CompanionPreferences.accentColor.withAlphaComponent(min(1, CompanionPreferences.backgroundOpacity + 0.08))
                      : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)).setFill()
             path.fill()
+        case .transparent:
+            break
         }
         if focused {
             CompanionPreferences.accentColor.withAlphaComponent(0.7).setStroke()
@@ -750,9 +930,10 @@ private final class SystemStatsPopoverController: NSObject {
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let client = AeroSpaceClient()
     private var statusItem: NSStatusItem?
+    private weak var openAtLoginItem: NSMenuItem?
     private var strip: WorkspaceStripView?
     private var statsPopoverController: SystemStatsPopoverController?
     private var stripHeightConstraint: NSLayoutConstraint?
@@ -761,12 +942,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventBuffer = ""
     private var reconnectWorkItem: DispatchWorkItem?
     private var refreshWorkItem: DispatchWorkItem?
+    private var reconciliationWorkItem: DispatchWorkItem?
     private var currentWorkspaces: [Workspace] = []
     private var isRefreshing = false
     private var refreshPending = false
     private var isStopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CrashRecorder.install()
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: 1)
         item.autosaveName = "com.m-robot404.Companion.workspaceStrip"
@@ -774,6 +957,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
+        button.isBordered = false
+        button.focusRingType = .none
+        (button.cell as? NSButtonCell)?.highlightsBy = []
 
         let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: CompanionPreferences.size))
         strip.translatesAutoresizingMaskIntoConstraints = false
@@ -811,116 +997,57 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
-        func addChoice(_ title: String, key: String, value: String, selected: Bool, to parent: NSMenu) {
-            let item = NSMenuItem(title: title, action: #selector(menuChoiceChanged(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = [key, value]
-            item.state = selected ? .on : .off
-            parent.addItem(item)
-        }
-        let sizeMenu = NSMenu()
-        for size in [18, 20, 22, 24, 26, 28, 30] {
-            addChoice("\(size) pt", key: "stripSize", value: "\(size)", selected: Int(CompanionPreferences.size) == size, to: sizeMenu)
-        }
-        let sizeItem = NSMenuItem(title: "Size", action: nil, keyEquivalent: "")
-        sizeItem.submenu = sizeMenu
-        menu.addItem(sizeItem)
+        menu.delegate = self
 
-        let backgroundMenu = NSMenu()
-        for option in CompanionPreferences.Background.allCases {
-            addChoice(option.rawValue, key: "backgroundStyle", value: option.rawValue,
-                      selected: CompanionPreferences.background == option, to: backgroundMenu)
-        }
-        let backgroundItem = NSMenuItem(title: "Background", action: nil, keyEquivalent: "")
-        backgroundItem.submenu = backgroundMenu
-        menu.addItem(backgroundItem)
+        let loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleOpenAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        openAtLoginItem = loginItem
+        menu.addItem(loginItem)
 
-        let accentMenu = NSMenu()
-        for color in ["Purple", "Blue", "Pink", "Orange", "Green", "System"] {
-            addChoice(color, key: "accentColor", value: color, selected: CompanionPreferences.accent == color, to: accentMenu)
-        }
-        let accentItem = NSMenuItem(title: "Accent", action: nil, keyEquivalent: "")
-        accentItem.submenu = accentMenu
-        menu.addItem(accentItem)
-        let spacingMenu = NSMenu()
-        for value in [2, 3, 4, 5, 6, 8, 10] {
-            addChoice("\(value) pt", key: "workspaceSpacing", value: "\(value)",
-                      selected: Int(CompanionPreferences.workspaceSpacing) == value, to: spacingMenu)
-        }
-        let spacingItem = NSMenuItem(title: "Workspace Spacing", action: nil, keyEquivalent: "")
-        spacingItem.submenu = spacingMenu
-        menu.addItem(spacingItem)
+        let logsItem = NSMenuItem(title: "Open Crash Logs", action: #selector(openCrashLogs), keyEquivalent: "")
+        logsItem.target = self
+        menu.addItem(logsItem)
 
-        let iconSpacingMenu = NSMenu()
-        for value in [1, 2, 3, 4, 5, 6, 8] {
-            addChoice("\(value) pt", key: "iconSpacing", value: "\(value)",
-                      selected: Int(CompanionPreferences.iconSpacing) == value, to: iconSpacingMenu)
-        }
-        let iconSpacingItem = NSMenuItem(title: "App Icon Spacing", action: nil, keyEquivalent: "")
-        iconSpacingItem.submenu = iconSpacingMenu
-        menu.addItem(iconSpacingItem)
-
-        let opacityMenu = NSMenu()
-        for value in [45, 60, 75, 82, 90, 100] {
-            addChoice("\(value)%", key: "inactiveIconOpacity", value: String(Double(value) / 100),
-                      selected: Int(CompanionPreferences.inactiveIconOpacity * 100) == value, to: opacityMenu)
-        }
-        let opacityItem = NSMenuItem(title: "Inactive Icon Opacity", action: nil, keyEquivalent: "")
-        opacityItem.submenu = opacityMenu
-        menu.addItem(opacityItem)
-
-        let backgroundOpacityMenu = NSMenu()
-        for value in [10, 20, 35, 50, 65, 80, 92, 100] {
-            addChoice("\(value)%", key: "backgroundOpacity", value: String(Double(value) / 100),
-                      selected: Int(CompanionPreferences.backgroundOpacity * 100) == value, to: backgroundOpacityMenu)
-        }
-        let backgroundOpacityItem = NSMenuItem(title: "Background Opacity", action: nil, keyEquivalent: "")
-        backgroundOpacityItem.submenu = backgroundOpacityMenu
-        menu.addItem(backgroundOpacityItem)
-        menu.addItem(NSMenuItem.separator())
-        let statsItem = NSMenuItem(title: "System Stats…", action: #selector(showSystemStats), keyEquivalent: "")
-        statsItem.target = self
-        menu.addItem(statsItem)
-        let notchInfo = NSMenuItem(title: "Position & Notch: Managed by macOS", action: nil, keyEquivalent: "")
-        notchInfo.isEnabled = false
-        menu.addItem(notchInfo)
-        menu.addItem(NSMenuItem.separator())
-
-        func addToggle(_ title: String, key: String, value: Bool) {
-            let item = NSMenuItem(title: title, action: #selector(menuToggleChanged(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = key
-            item.state = value ? .on : .off
-            menu.addItem(item)
-        }
-        addToggle("Show only occupied workspaces", key: "occupiedOnly", value: CompanionPreferences.occupiedOnly)
-        addToggle("Show app icons", key: "showIcons", value: CompanionPreferences.showIcons)
-        addToggle("Show workspace labels", key: "showLabels", value: CompanionPreferences.showLabels)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "About Companion", action: #selector(showAbout), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Quit Companion", action: #selector(quit), keyEquivalent: "q").target = self
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "Quit Companion", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
         return menu
     }
 
-    @objc private func menuChoiceChanged(_ item: NSMenuItem) {
-        guard let values = item.representedObject as? [String], values.count == 2 else { return }
-        let value: Any
-        if ["stripSize", "workspaceSpacing", "iconSpacing", "inactiveIconOpacity", "backgroundOpacity"].contains(values[0]) {
-            value = Double(values[1]) ?? 22
-        } else { value = values[1] }
-        CompanionPreferences.save(values[0], value)
-        strip?.contextMenu = makeContextMenu()
+    func menuWillOpen(_ menu: NSMenu) {
+        openAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    @objc private func menuToggleChanged(_ item: NSMenuItem) {
-        guard let key = item.representedObject as? String else { return }
-        CompanionPreferences.save(key, item.state != .on)
-        strip?.contextMenu = makeContextMenu()
+    @objc private func toggleOpenAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            openAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } catch {
+            NSApp.presentError(error)
+        }
+    }
+
+    @objc private func openCrashLogs() {
+        do {
+            try FileManager.default.createDirectory(at: CrashRecorder.directory,
+                                                    withIntermediateDirectories: true)
+            NSWorkspace.shared.open(CrashRecorder.directory)
+        } catch {
+            NSApp.presentError(error)
+        }
     }
 
     @objc private func preferencesChanged() {
         stripHeightConstraint?.constant = CompanionPreferences.size
+        strip?.invalidateWorkspaceLayout()
         renderWorkspaces()
+        updateWindowReconciliation()
     }
 
     @objc private func applicationLifecycleChanged(_ notification: Notification) { scheduleRefresh() }
@@ -935,7 +1062,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInteractive).async { [client = self.client] in client.focusWindow(id) }
             self.scheduleRefresh()
         })
-        statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
+        let desiredLength = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
+        if statusItem?.length != desiredLength { statusItem?.length = desiredLength }
     }
 
     private func refresh() {
@@ -954,6 +1082,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.refreshPending = false
                     self.refresh()
                 }
+                self.updateWindowReconciliation()
             }
         }
     }
@@ -963,6 +1092,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let work = DispatchWorkItem { [weak self] in self?.refresh() }
         refreshWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+    }
+
+    // AeroSpace does not expose a window-closed subscription event in its
+    // documented event set. Reconcile while icons are present so closing the
+    // final window on an otherwise-empty workspace cannot leave a stale icon.
+    // This timer stops as soon as the window list is empty or icons are disabled.
+    private func updateWindowReconciliation() {
+        let hasVisibleWindowIcons = CompanionPreferences.showIcons
+            && currentWorkspaces.contains { !$0.windows.isEmpty }
+        guard !isStopping, hasVisibleWindowIcons else {
+            reconciliationWorkItem?.cancel()
+            reconciliationWorkItem = nil
+            return
+        }
+        guard reconciliationWorkItem == nil else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconciliationWorkItem = nil
+            self.refresh()
+        }
+        reconciliationWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25, execute: work)
     }
 
     private func startEventStream() {
@@ -1029,6 +1181,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         isStopping = true
         refreshWorkItem?.cancel()
         reconnectWorkItem?.cancel()
+        reconciliationWorkItem?.cancel()
+        reconciliationWorkItem = nil
         eventPipe?.fileHandleForReading.readabilityHandler = nil
         eventProcess?.terminate()
         eventProcess = nil
