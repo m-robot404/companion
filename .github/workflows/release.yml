@@ -1,0 +1,42 @@
+name: Release Companion
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: bash scripts/build-app.sh release
+      - name: Verify app bundle
+        run: |
+          test -x build/Companion.app/Contents/MacOS/Companion
+          plutil -lint build/Companion.app/Contents/Info.plist
+          test -s build/Companion.app/Contents/Resources/AppIcon.icns
+          codesign --verify --deep --strict build/Companion.app
+          test "$(defaults read "$PWD/build/Companion.app/Contents/Info" CFBundleShortVersionString)" = "0.1"
+      - name: Package release
+        run: ditto -c -k --sequesterRsrc --keepParent build/Companion.app Companion-macOS-0.1-beta.zip
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Companion 0.1 Beta
+          body: |
+            Companion 0.1 Beta
+
+            Native macOS menu-bar workspace companion for AeroSpace.
+
+            - macOS 26 or later
+            - Apple Silicon build
+            - Ad-hoc signed; not Developer ID signed or notarized
+            - Screen Recording permission is optional and only needed for window thumbnails
+          files: Companion-macOS-0.1-beta.zip
+          prerelease: true
+          make_latest: false
