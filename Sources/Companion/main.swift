@@ -310,8 +310,10 @@ private final class WorkspaceContentView: NSView {
     var workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
-    private var previewPopover: NSPopover?
+    private var previewPanel: NSPanel?
     private weak var previewAnchor: NSView?
+    private weak var previewImageView: NSImageView?
+    private var previewTask: Task<Void, Never>?
     private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
@@ -448,9 +450,7 @@ private final class WorkspaceContentView: NSView {
             }
             target.onExit = { [weak self, weak target] in
                 guard let self, self.previewAnchor === target else { return }
-                self.previewPopover?.close()
-                self.previewPopover = nil
-                self.previewAnchor = nil
+                self.hidePreview()
             }
             target.onPress = { [weak self] event in
                 self?.activate(group, event: event)
@@ -462,9 +462,7 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func activate(_ group: AppGroup, event: NSEvent) {
-        previewPopover?.close()
-        previewPopover = nil
-        previewAnchor = nil
+        hidePreview()
         if group.windows.count == 1, let window = group.windows.first {
             onFocusWindow(window.id)
             return
@@ -481,29 +479,31 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
-        if previewAnchor === anchor, previewPopover?.isShown == true { return }
-        previewPopover?.close()
-        previewPopover = nil
-        let popover = NSPopover()
-        popover.behavior = .applicationDefined
-        let controller = NSViewController()
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        guard let window = group.windows.first else { return }
+        if previewAnchor === anchor, previewPanel?.isVisible == true { return }
+        hidePreview()
+
+        // A mouse-transparent panel avoids NSPopover's tracking/close cycle at
+        // the lower edge of the menu bar. It never participates in hover hit-testing.
+        let width: CGFloat = 232
+        let height: CGFloat = 156
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.97).cgColor
         host.layer?.cornerRadius = 10
+        host.layer?.masksToBounds = true
+
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.image = AppIconCache.shared.image(for: group.bundleID, size: 64)
-        Task { @MainActor [weak self, weak imageView] in
-            guard let self, let imageView,
-                  let captured = await self.previewImage(for: group.windows[0]) else { return }
-            imageView.image = captured
-        }
         host.addSubview(imageView)
-        let title = NSTextField(labelWithString: group.windows[0].title)
+
+        let title = NSTextField(labelWithString: window.title.isEmpty ? group.appName : window.title)
         title.frame = NSRect(x: 12, y: 10, width: 208, height: 20)
         title.lineBreakMode = .byTruncatingMiddle
         title.font = .systemFont(ofSize: 11, weight: .medium)
         host.addSubview(title)
+
         if group.windows.count > 1 {
             let count = NSTextField(labelWithString: "\(group.windows.count) windows — click to choose")
             count.frame = NSRect(x: 12, y: 26, width: 208, height: 12)
@@ -511,13 +511,47 @@ private final class WorkspaceContentView: NSView {
             count.textColor = .secondaryLabelColor
             host.addSubview(count)
         }
-        controller.view = host
-        popover.contentViewController = controller
-        popover.show(relativeTo: NSRect(x: anchor.bounds.midX - 2, y: anchor.bounds.midY,
-                                        width: 4, height: 2),
-                     of: anchor, preferredEdge: .maxY)
+
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentView = host
+
+        if let window = anchor.window {
+            let anchorRect = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+            panel.setFrameOrigin(NSPoint(x: anchorRect.midX - width / 2,
+                                         y: anchorRect.minY - height - 4))
+        }
+
         previewAnchor = anchor
-        previewPopover = popover
+        previewImageView = imageView
+        previewPanel = panel
+        panel.orderFrontRegardless()
+
+        // Show the cached app icon immediately; capture and replace it asynchronously.
+        previewTask = Task { @MainActor [weak self, weak imageView, weak anchor] in
+            guard let self, let imageView, let anchor,
+                  let captured = await self.previewImage(for: window),
+                  !Task.isCancelled, self.previewAnchor === anchor else { return }
+            imageView.image = captured
+        }
+    }
+
+    private func hidePreview() {
+        previewTask?.cancel()
+        previewTask = nil
+        previewPanel?.orderOut(nil)
+        previewPanel = nil
+        previewImageView = nil
+        previewAnchor = nil
     }
 
     private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
@@ -526,9 +560,7 @@ private final class WorkspaceContentView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        previewPopover?.close()
-        previewPopover = nil
-        previewAnchor = nil
+        hidePreview()
         onSelect(workspace.name)
     }
 
@@ -842,7 +874,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         button.title = ""
         button.image = nil
         button.isBordered = false
-        button.appearsDisabled = true
         button.focusRingType = .none
         (button.cell as? NSButtonCell)?.highlightsBy = []
 
