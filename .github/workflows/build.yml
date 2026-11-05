@@ -1,0 +1,28 @@
+name: Build Companion
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: bash scripts/build-app.sh release
+      - name: Verify app bundle
+        run: |
+          test -x build/Companion.app/Contents/MacOS/Companion
+          plutil -lint build/Companion.app/Contents/Info.plist
+          codesign --verify --deep --strict build/Companion.app
+      - name: Package
+        run: ditto -c -k --sequesterRsrc --keepParent build/Companion.app Companion-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Companion-macOS
+          path: Companion-macOS.zip
+          if-no-files-found: error
+          retention-days: 14
