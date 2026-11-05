@@ -3,21 +3,20 @@ import SwiftUI
 
 private struct Workspace: Identifiable, Equatable {
     let id: String
-    let name: String
     let isFocused: Bool
     let bundleIDs: [String]
 }
 
 @MainActor
 private final class AeroSpaceClient {
-    private let executableCandidates = [
+    private let candidates = [
         NSString(string: "~/.local/bin/aerospace").expandingTildeInPath,
         "/opt/homebrew/bin/aerospace",
         "/usr/local/bin/aerospace"
     ]
 
     private var executable: String? {
-        executableCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private func run(_ arguments: [String]) -> String? {
@@ -25,12 +24,12 @@ private final class AeroSpaceClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
+        let output = Pipe()
+        process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return nil }
             return String(data: data, encoding: .utf8)
@@ -39,72 +38,71 @@ private final class AeroSpaceClient {
         }
     }
 
-    func workspaces() -> [Workspace] {
-        guard let workspaceOutput = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
-              let windowOutput = run(["list-windows", "--all", "--format", "%{app-bundle-id}|%{workspace}"]) else {
-            return []
-        }
+    func snapshot() -> [Workspace]? {
+        guard
+            let workspaceText = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
+            let windowText = run(["list-windows", "--all", "--format", "%{app-bundle-id}|%{workspace}"])
+        else { return nil }
 
-        var appsByWorkspace: [String: [String]] = [:]
-        for line in windowOutput.split(whereSeparator: \.isNewline) {
+        var apps: [String: [String]] = [:]
+        for line in windowText.split(whereSeparator: \.isNewline) {
             let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-            guard fields.count >= 2, !fields[0].isEmpty, !fields[1].isEmpty else { continue }
-            var ids = appsByWorkspace[fields[1], default: []]
-            if !ids.contains(fields[0]) { ids.append(fields[0]) }
-            appsByWorkspace[fields[1]] = ids
+            guard fields.count == 2, !fields[0].isEmpty, !fields[1].isEmpty else { continue }
+            if !apps[fields[1], default: []].contains(fields[0]) {
+                apps[fields[1], default: []].append(fields[0])
+            }
         }
 
-        return workspaceOutput.split(whereSeparator: \.isNewline).compactMap { line in
+        return workspaceText.split(whereSeparator: \.isNewline).compactMap { line in
             let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard let name = fields.first, !name.isEmpty else { return nil }
-            let focused = fields.count > 1 && fields[1].trimmingCharacters(in: .whitespaces) == "true"
-            return Workspace(id: name, name: name, isFocused: focused,
-                             bundleIDs: appsByWorkspace[name, default: []])
+            return Workspace(
+                id: name,
+                isFocused: fields.count > 1 && fields[1].trimmingCharacters(in: .whitespaces) == "true",
+                bundleIDs: apps[name, default: []]
+            )
         }
     }
 
-    func focus(_ workspace: String) {
-        _ = run(["workspace", workspace])
+    func focus(_ name: String) {
+        _ = run(["workspace", name])
+    }
+
+    func subscribe(pipe: Pipe, onExit: @escaping () -> Void) throws -> Process {
+        guard let executable else {
+            throw NSError(domain: "Companion.AeroSpace", code: 1)
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = [
+            "subscribe", "focus-changed", "focused-workspace-changed",
+            "focused-monitor-changed", "window-detected"
+        ]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { _ in onExit() }
+        try process.run()
+        return process
     }
 }
 
-private struct WorkspaceCompartment: View {
-    let workspace: Workspace
-    private let iconSize: CGFloat = 15
+@MainActor
+private final class AppIconCache {
+    static let shared = AppIconCache()
+    private let cache = NSCache<NSString, NSImage>()
 
-    var body: some View {
-        HStack(spacing: 5) {
-            Text(workspace.name)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.primary)
-                .frame(minWidth: 11)
+    private init() { cache.countLimit = 64 }
 
-            HStack(spacing: 3) {
-                ForEach(workspace.bundleIDs.prefix(3), id: \.self) { bundleID in
-                    AppIcon(bundleID: bundleID)
-                        .frame(width: iconSize, height: iconSize)
-                }
-                if workspace.bundleIDs.count > 3 {
-                    Text("+\(workspace.bundleIDs.count - 3)")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-            }
+    func image(for bundleID: String) -> NSImage? {
+        let key = bundleID as NSString
+        if let image = cache.object(forKey: key) { return image }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            return nil
         }
-        .padding(.horizontal, 7)
-        .frame(height: 23)
-        .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(workspace.isFocused ? Color.accentColor.opacity(0.23) : Color.primary.opacity(0.075))
-                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(workspace.isFocused ? Color.accentColor.opacity(0.55) : Color.primary.opacity(0.09), lineWidth: 0.7)
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Workspace \(workspace.name), \(workspace.bundleIDs.count) apps")
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        image.size = NSSize(width: 15, height: 15)
+        cache.setObject(image, forKey: key)
+        return image
     }
 }
 
@@ -113,20 +111,57 @@ private struct AppIcon: View {
 
     var body: some View {
         Group {
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
+            if let image = AppIconCache.shared.image(for: bundleID) {
+                Image(nsImage: image).resizable().interpolation(.high).scaledToFit()
             } else {
-                Image(systemName: "app")
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(.secondary)
-                    .padding(2)
+                Image(systemName: "app").resizable().scaledToFit()
+                    .foregroundStyle(.secondary).padding(2)
             }
         }
+        .frame(width: 15, height: 15)
         .help(bundleID)
+    }
+}
+
+private struct WorkspaceCompartment: View {
+    let workspace: Workspace
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(workspace.id)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospaced()
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .frame(minWidth: 11)
+            HStack(spacing: 3) {
+                ForEach(workspace.bundleIDs.prefix(3), id: \.self) { AppIcon(bundleID: $0) }
+                if workspace.bundleIDs.count > 3 {
+                    Text("+\(workspace.bundleIDs.count - 3)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 7)
+        .frame(height: 22)
+        .background {
+            shape.fill(workspace.isFocused
+                ? Color.accentColor.opacity(0.17)
+                : Color.primary.opacity(0.065))
+        }
+        .glassEffect(.regular, in: shape)
+        .overlay {
+            shape.strokeBorder(
+                workspace.isFocused ? Color.accentColor.opacity(0.52) : Color.primary.opacity(0.09),
+                lineWidth: 0.7
+            )
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Workspace \(workspace.id), \(workspace.bundleIDs.count) applications")
     }
 }
 
@@ -137,69 +172,132 @@ private struct WorkspaceStrip: View {
     var body: some View {
         HStack(spacing: 5) {
             ForEach(workspaces) { workspace in
-                Button {
-                    onSelect(workspace.name)
-                } label: {
+                Button { onSelect(workspace.id) } label: {
                     WorkspaceCompartment(workspace: workspace)
                 }
                 .buttonStyle(.plain)
-                .help("Switch to workspace \(workspace.name)")
+                .help("Switch to workspace \(workspace.id)")
             }
         }
         .padding(.horizontal, 2)
-        .frame(height: 26)
-        .fixedSize()
+        .frame(height: 22)
+        .fixedSize(horizontal: true, vertical: true)
     }
 }
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = AeroSpaceClient()
-    private var statusItem: NSStatusItem!
-    private var hostingView: NSHostingView<WorkspaceStrip>!
-    private var refreshTimer: Timer?
-    private var currentWorkspaces: [Workspace] = []
+    private var statusItem: NSStatusItem?
+    private var host: NSHostingView<WorkspaceStrip>?
+    private var stream: Process?
+    private var streamPipe: Pipe?
+    private var buffer = ""
+    private var reconnect: DispatchWorkItem?
+    private var refreshTask: DispatchWorkItem?
+    private var workspaces: [Workspace] = []
+    private var stopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        guard let button = statusItem.button else { return }
-        button.title = ""
-        button.image = nil
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
 
-        hostingView = NSHostingView(rootView: WorkspaceStrip(workspaces: []) { [weak self] in
-            self?.client.focus($0)
-            self?.refresh()
+        let view = NSHostingView(rootView: WorkspaceStrip(workspaces: []) { [weak self] name in
+            self?.client.focus(name)
+            self?.scheduleRefresh()
         })
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-        button.addSubview(hostingView)
-        NSLayoutConstraint.activate([
-            hostingView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
-            hostingView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
-            hostingView.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-            hostingView.heightAnchor.constraint(equalToConstant: 26)
-        ])
+        view.frame = NSRect(x: 0, y: 0, width: 30, height: 22)
+        host = view
+        item.view = view
 
         refresh()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
+        startStream()
     }
 
     private func refresh() {
-        let updated = client.workspaces()
-        guard updated != currentWorkspaces else { return }
-        currentWorkspaces = updated
-        hostingView.rootView = WorkspaceStrip(workspaces: updated) { [weak self] in
-            self?.client.focus($0)
-            self?.refresh()
+        guard let latest = client.snapshot(), latest != workspaces else { return }
+        workspaces = latest
+        host?.rootView = WorkspaceStrip(workspaces: latest) { [weak self] name in
+            self?.client.focus(name)
+            self?.scheduleRefresh()
         }
-        hostingView.invalidateIntrinsicContentSize()
-        statusItem.length = hostingView.fittingSize.width
+        guard let host, let statusItem else { return }
+        let width = max(1, ceil(host.fittingSize.width))
+        host.frame = NSRect(x: 0, y: 0, width: width, height: 22)
+        statusItem.length = width
+    }
+
+    private func scheduleRefresh() {
+        refreshTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.refresh() }
+        refreshTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: task)
+    }
+
+    private func startStream() {
+        guard !stopping, stream == nil else { return }
+        let pipe = Pipe()
+        do {
+            let process = try client.subscribe(pipe: pipe) { [weak self] in
+                DispatchQueue.main.async { self?.streamEnded() }
+            }
+            streamPipe = pipe
+            stream = process
+            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                Task { @MainActor in self?.receive(text) }
+            }
+        } catch {
+            scheduleReconnect()
+        }
+    }
+
+    private func receive(_ text: String) {
+        buffer += text
+        while let end = buffer.firstIndex(of: "\n") {
+            let line = String(buffer[..<end])
+            buffer.removeSubrange(...end)
+            guard
+                let data = line.data(using: .utf8),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let event = object["_event"] as? String
+            else { continue }
+            if ["focus-changed", "focused-workspace-changed",
+                "focused-monitor-changed", "window-detected"].contains(event) {
+                scheduleRefresh()
+            }
+        }
+    }
+
+    private func streamEnded() {
+        streamPipe?.fileHandleForReading.readabilityHandler = nil
+        streamPipe = nil
+        stream = nil
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard !stopping, reconnect == nil else { return }
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconnect = nil
+            self.refresh()
+            self.startStream()
+        }
+        reconnect = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: task)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
+        stopping = true
+        refreshTask?.cancel()
+        reconnect?.cancel()
+        streamPipe?.fileHandleForReading.readabilityHandler = nil
+        stream?.terminate()
+        stream = nil
+        streamPipe = nil
     }
 }
 
@@ -208,8 +306,6 @@ struct CompanionApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Settings {
-            EmptyView()
-        }
+        Settings { EmptyView() }
     }
 }
