@@ -1,5 +1,7 @@
 # Companion
 
+**Version 0.1 Beta** — early preview release.
+
 A compact native macOS menu-bar companion for AeroSpace. It adds a small workspace island to the existing macOS menu bar; it does not replace the menu bar or create a separate full-width bar.
 
 ## Interface
@@ -10,7 +12,9 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 - Click a single app icon to focus that exact AeroSpace window. Click a grouped icon to choose a specific window from a menu.
 - Repeated windows from the same app are grouped with a count badge.
 - Hover an app icon for a lightweight window preview. Window thumbnails use ScreenCaptureKit and require Screen Recording permission; if macOS denies capture or the target window is unavailable, the preview retains the app icon and window title.
-- A right-click on the strip opens a minimal menu with Quit Companion.
+- A right-click on the strip opens a minimal menu with Open at Login, Open Crash Logs, and Quit Companion.
+- Open at Login uses macOS Service Management. The setting can also be managed in System Settings → General → Login Items.
+- Crash recording writes uncaught Objective-C exception details and fatal-signal markers to `~/Library/Logs/Companion/crash.log`. Full native crash reports and stack traces are still generated and managed by macOS in DiagnosticReports; Companion does not upload crash data.
 - System Stats opens on demand and samples system CPU, memory, and Companion's physical footprint; it does not run a background polling loop.
 - The status item uses AppKit's native menu-bar placement and saves its position. macOS handles the built-in notch exclusion and available status-item area; Companion does not create an overlay window or move itself across the notch.
 
@@ -31,6 +35,8 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 - Screen Recording permission is optional; without it, hover previews show app icon and window title rather than a screenshot.
 
 ## Build
+
+This beta is version `0.1` (build `1`).
 
 Run:
 
