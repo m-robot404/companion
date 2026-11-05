@@ -455,13 +455,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: CompanionPreferences.size))
         strip.translatesAutoresizingMaskIntoConstraints = false
         button.addSubview(strip)
+        let heightConstraint = strip.heightAnchor.constraint(equalToConstant: CompanionPreferences.size)
         NSLayoutConstraint.activate([
             strip.leadingAnchor.constraint(equalTo: button.leadingAnchor),
             strip.trailingAnchor.constraint(equalTo: button.trailingAnchor),
             strip.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-            strip.heightAnchor.constraint(equalToConstant: CompanionPreferences.size)
+            heightConstraint
         ])
-        stripHeightConstraint = strip.constraints.first { $0.firstAttribute == .height }
+        stripHeightConstraint = heightConstraint
         self.strip = strip
 
         let controls = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
