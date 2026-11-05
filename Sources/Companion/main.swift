@@ -435,7 +435,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func menuChoiceChanged(_ item: NSMenuItem) {
         guard let values = item.representedObject as? [String], values.count == 2 else { return }
-        let value: Any = values[0] == "stripSize" ? (Double(values[1]) ?? 22) : values[1]
+        let value: Any
+        if values[0] == "stripSize" { value = Double(values[1]) ?? 22 }
+        else { value = values[1] }
         CompanionPreferences.save(values[0], value)
         strip?.contextMenu = makeContextMenu()
     }
@@ -465,7 +467,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         guard !isRefreshing else { refreshPending = true; return }
         isRefreshing = true
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, client] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, client = self.client] in
             let latest = client.snapshot()
             DispatchQueue.main.async {
                 guard let self else { return }
