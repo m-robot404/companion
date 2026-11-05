@@ -18,11 +18,9 @@ jobs:
           test -x build/Companion.app/Contents/MacOS/Companion
           plutil -lint build/Companion.app/Contents/Info.plist
           codesign --verify --deep --strict build/Companion.app
-      - name: Package
-        run: ditto -c -k --sequesterRsrc --keepParent build/Companion.app Companion-macOS.zip
       - uses: actions/upload-artifact@v4
         with:
           name: Companion-macOS
-          path: Companion-macOS.zip
+          path: build/Companion.app
           if-no-files-found: error
           retention-days: 14
