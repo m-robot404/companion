@@ -1,7 +1,7 @@
 name: Build Companion
 on:
   push:
-    branches: [main]
+    branches: [main, feature/companion-workspace-enhancements]
   pull_request:
   workflow_dispatch:
 permissions:
