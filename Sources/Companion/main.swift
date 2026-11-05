@@ -204,6 +204,76 @@ private final class WorkspaceIconHitView: NSView {
     override func mouseDown(with event: NSEvent) { onPress?(event) }
 }
 
+/// ScreenCaptureKit source modeled on the on-demand, cached capture pipeline used by
+/// the open-source HoverDock project (MIT): reuse the shareable-window map briefly and
+/// keep a small in-memory thumbnail cache instead of querying ScreenCaptureKit per hover.
+private actor WindowPreviewSource {
+    static let shared = WindowPreviewSource()
+    private var windowsByID: [CGWindowID: SCWindow] = [:]
+    private var refreshedAt = Date.distantPast
+    private var thumbnails: [CGWindowID: CGImage] = [:]
+    private var thumbnailOrder: [CGWindowID] = []
+    private let cacheLimit = 24
+
+    private func refreshWindowMap() async {
+        guard Date().timeIntervalSince(refreshedAt) >= 1 || windowsByID.isEmpty else { return }
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: false
+        ) else { return }
+        windowsByID = Dictionary(content.windows.map { ($0.windowID, $0) },
+                                 uniquingKeysWith: { _, latest in latest })
+        refreshedAt = Date()
+    }
+
+    func capture(_ window: WorkspaceWindow) async -> CGImage? {
+        guard let rawID = UInt32(window.id.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        let id = CGWindowID(rawID)
+        await refreshWindowMap()
+
+        if let cached = thumbnails[id] { return cached }
+
+        // Prefer AeroSpace's exact CGWindowID. If ScreenCaptureKit's map is temporarily
+        // out of sync, use a unique bundle-ID + title match; never guess between windows.
+        var target = windowsByID[id]
+        if target == nil {
+            let candidates = windowsByID.values.filter {
+                $0.owningApplication?.bundleIdentifier == window.bundleID
+            }
+            if !window.title.isEmpty {
+                let titleMatches = candidates.filter { $0.title == window.title }
+                if titleMatches.count == 1 { target = titleMatches[0] }
+            }
+            if target == nil && candidates.count == 1 { target = candidates[0] }
+        }
+        guard let target else { return nil }
+
+        let sourceWidth = max(1, target.frame.width)
+        let sourceHeight = max(1, target.frame.height)
+        let scale = min(1, 480 / sourceWidth, 270 / sourceHeight)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(sourceWidth * scale))
+        configuration.height = max(1, Int(sourceHeight * scale))
+        configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: SCContentFilter(desktopIndependentWindow: target),
+                configuration: configuration
+            )
+            thumbnails[id] = image
+            thumbnailOrder.removeAll { $0 == id }
+            thumbnailOrder.append(id)
+            while thumbnailOrder.count > cacheLimit {
+                thumbnails[thumbnailOrder.removeFirst()] = nil
+            }
+            return image
+        } catch {
+            return nil
+        }
+    }
+}
+
 @MainActor
 private final class WorkspaceContentView: NSView {
     let workspace: Workspace
@@ -211,6 +281,7 @@ private final class WorkspaceContentView: NSView {
     let onFocusWindow: (String) -> Void
     private var previewPopover: NSPopover?
     private weak var previewAnchor: NSView?
+    private var previewDismissWorkItem: DispatchWorkItem?
     private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
@@ -316,13 +387,13 @@ private final class WorkspaceContentView: NSView {
         for (frame, group) in iconFrames() {
             let target = WorkspaceIconHitView(frame: frame)
             target.onEnter = { [weak self] anchor in
+                self?.previewDismissWorkItem?.cancel()
+                self?.previewDismissWorkItem = nil
                 self?.showPreview(for: group, anchoredTo: anchor)
             }
             target.onExit = { [weak self, weak target] in
                 guard let self, self.previewAnchor === target else { return }
-                self.previewPopover?.close()
-                self.previewPopover = nil
-                self.previewAnchor = nil
+                self.schedulePreviewDismissal()
             }
             target.onPress = { [weak self] event in
                 self?.activate(group, event: event)
@@ -354,9 +425,30 @@ private final class WorkspaceContentView: NSView {
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
+    private func schedulePreviewDismissal() {
+        previewDismissWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let pointer = NSEvent.mouseLocation
+            if self.previewPopover?.contentViewController?.view.window?.frame.contains(pointer) == true {
+                return
+            }
+            self.previewPopover?.close()
+            self.previewPopover = nil
+            self.previewAnchor = nil
+            self.previewDismissWorkItem = nil
+        }
+        previewDismissWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
+        previewDismissWorkItem?.cancel()
+        previewDismissWorkItem = nil
+        previewPopover?.close()
+        previewPopover = nil
         let popover = NSPopover()
-        popover.behavior = .transient
+        popover.behavior = .applicationDefined
         let controller = NSViewController()
         let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
         host.wantsLayer = true
@@ -392,26 +484,8 @@ private final class WorkspaceContentView: NSView {
     }
 
     private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
-        guard let id = UInt32(window.id.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
-        let windowID = CGWindowID(id)
-
-        // Always ask ScreenCaptureKit for the selected window. A preflight check can
-        // be stale immediately after the user grants permission in System Settings.
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let target = content.windows.first(where: { $0.windowID == windowID }) else { return nil }
-            let filter = SCContentFilter(desktopIndependentWindow: target)
-            let configuration = SCStreamConfiguration()
-            configuration.width = 480
-            configuration.height = 270
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-        } catch {
-            return nil
-        }
+        guard let image = await WindowPreviewSource.shared.capture(window) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     override func mouseDown(with event: NSEvent) {
