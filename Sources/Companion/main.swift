@@ -47,7 +47,6 @@ private struct Workspace: Equatable {
     let bundleIDs: [String]
 }
 
-@MainActor
 private final class AeroSpaceClient {
     private let candidates = [
         NSString(string: "~/.local/bin/aerospace").expandingTildeInPath,
@@ -211,9 +210,15 @@ private final class WorkspaceStripView: NSView {
     private var glassContainer: NSGlassEffectContainerView?
     private var selection: ((String) -> Void)?
     private var compartmentViews: [NSView] = []
+    var contextMenu: NSMenu?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: measuredWidth, height: CompanionPreferences.size)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let contextMenu else { return }
+        NSMenu.popUpContextMenu(contextMenu, with: event, for: self)
     }
 
     private var gap: CGFloat { 5 * CompanionPreferences.size / 22 }
@@ -325,120 +330,9 @@ private final class CompartmentBackgroundView: NSView {
 }
 
 @MainActor
-private final class PreferencesWindowController: NSObject {
-    private var window: NSWindow?
-
-    func show() {
-        if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 390),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "Companion Preferences"
-        window.center()
-        window.isReleasedWhenClosed = false
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 18
-        stack.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
-
-        let sizeLabel = NSTextField(labelWithString: "Size")
-        let sizeSlider = NSSlider(value: Double(CompanionPreferences.size), minValue: 18, maxValue: 30,
-                                  target: self, action: #selector(sizeChanged(_:)))
-        sizeSlider.isContinuous = true
-        let sizeValue = NSTextField(labelWithString: "\(Int(CompanionPreferences.size)) pt")
-        sizeSlider.tag = 100
-        sizeValue.tag = 101
-        let sizeRow = NSStackView(views: [sizeLabel, sizeSlider, sizeValue])
-        sizeRow.orientation = .horizontal
-        sizeRow.alignment = .centerY
-        sizeRow.distribution = .fill
-        sizeSlider.widthAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
-        stack.addArrangedSubview(sizeRow)
-
-        let backgroundLabel = NSTextField(labelWithString: "Background")
-        let background = NSPopUpButton()
-        CompanionPreferences.Background.allCases.forEach { background.addItem(withTitle: $0.rawValue) }
-        background.selectItem(withTitle: CompanionPreferences.background.rawValue)
-        background.target = self
-        background.action = #selector(backgroundChanged(_:))
-        stack.addArrangedSubview(backgroundLabel)
-        stack.addArrangedSubview(background)
-
-        let accentLabel = NSTextField(labelWithString: "Accent color")
-        let accent = NSPopUpButton()
-        ["Purple", "Blue", "Pink", "Orange", "Green", "System"].forEach { accent.addItem(withTitle: $0) }
-        accent.selectItem(withTitle: CompanionPreferences.accent)
-        accent.target = self
-        accent.action = #selector(accentChanged(_:))
-        stack.addArrangedSubview(accentLabel)
-        stack.addArrangedSubview(accent)
-
-        let separator = NSView()
-        separator.wantsLayer = true
-        separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        separator.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        stack.addArrangedSubview(separator)
-        stack.addArrangedSubview(makeToggle("Show only occupied workspaces", key: "occupiedOnly", value: CompanionPreferences.occupiedOnly))
-        stack.addArrangedSubview(makeToggle("Show app icons", key: "showIcons", value: CompanionPreferences.showIcons))
-        stack.addArrangedSubview(makeToggle("Show workspace labels", key: "showLabels", value: CompanionPreferences.showLabels))
-
-        let note = NSTextField(wrappingLabelWithString: "Changes are saved automatically.")
-        note.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(note)
-
-        let container = NSView()
-        container.addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor)
-        ])
-        window.contentView = container
-        self.window = window
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func makeToggle(_ title: String, key: String, value: Bool) -> NSButton {
-        let button = NSButton(checkboxWithTitle: title, target: self, action: #selector(toggleChanged(_:)))
-        button.state = value ? .on : .off
-        button.identifier = NSUserInterfaceItemIdentifier(key)
-        return button
-    }
-
-    @objc private func sizeChanged(_ sender: NSSlider) {
-        CompanionPreferences.save("stripSize", sender.doubleValue)
-        if let value = sender.superview?.viewWithTag(101) as? NSTextField {
-            value.stringValue = "\(Int(sender.doubleValue)) pt"
-        }
-    }
-    @objc private func backgroundChanged(_ sender: NSPopUpButton) {
-        CompanionPreferences.save("backgroundStyle", sender.titleOfSelectedItem ?? "Glass")
-    }
-    @objc private func accentChanged(_ sender: NSPopUpButton) {
-        CompanionPreferences.save("accentColor", sender.titleOfSelectedItem ?? "Purple")
-    }
-    @objc private func toggleChanged(_ sender: NSButton) {
-        guard let key = sender.identifier?.rawValue else { return }
-        CompanionPreferences.save(key, sender.state == .on)
-    }
-}
-
-@MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = AeroSpaceClient()
-    private let preferencesController = PreferencesWindowController()
     private var statusItem: NSStatusItem?
-    private var controlsItem: NSStatusItem?
     private var strip: WorkspaceStripView?
     private var stripHeightConstraint: NSLayoutConstraint?
     private var eventProcess: Process?
@@ -447,6 +341,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reconnectWorkItem: DispatchWorkItem?
     private var refreshWorkItem: DispatchWorkItem?
     private var currentWorkspaces: [Workspace] = []
+    private var isRefreshing = false
+    private var refreshPending = false
     private var isStopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -469,18 +365,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         stripHeightConstraint = heightConstraint
         self.strip = strip
-
-        let controls = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        controlsItem = controls
-        controls.button?.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Companion menu")
-        controls.button?.imagePosition = .imageOnly
-        let menu = NSMenu()
-        menu.addItem(withTitle: "Preferences…", action: #selector(showPreferences), keyEquivalent: ",").target = self
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "About Companion", action: #selector(showAbout), keyEquivalent: "").target = self
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "Quit Companion", action: #selector(quit), keyEquivalent: "q").target = self
-        controls.menu = menu
+        strip.contextMenu = makeContextMenu()
 
         NotificationCenter.default.addObserver(self, selector: #selector(preferencesChanged),
                                                name: .companionPreferencesChanged, object: nil)
@@ -494,44 +379,114 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         startEventStream()
     }
 
-    @objc private func showPreferences() { preferencesController.show() }
     @objc private func showAbout() { NSApp.orderFrontStandardAboutPanel(nil) }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private func makeContextMenu() -> NSMenu {
+        let menu = NSMenu()
+        func addChoice(_ title: String, key: String, value: String, selected: Bool, to parent: NSMenu) {
+            let item = NSMenuItem(title: title, action: #selector(menuChoiceChanged(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = [key, value]
+            item.state = selected ? .on : .off
+            parent.addItem(item)
+        }
+        let sizeMenu = NSMenu()
+        for size in [18, 20, 22, 24, 26, 28, 30] {
+            addChoice("\(size) pt", key: "stripSize", value: "\(size)", selected: Int(CompanionPreferences.size) == size, to: sizeMenu)
+        }
+        let sizeItem = NSMenuItem(title: "Size", action: nil, keyEquivalent: "")
+        sizeItem.submenu = sizeMenu
+        menu.addItem(sizeItem)
+
+        let backgroundMenu = NSMenu()
+        for option in CompanionPreferences.Background.allCases {
+            addChoice(option.rawValue, key: "backgroundStyle", value: option.rawValue,
+                      selected: CompanionPreferences.background == option, to: backgroundMenu)
+        }
+        let backgroundItem = NSMenuItem(title: "Background", action: nil, keyEquivalent: "")
+        backgroundItem.submenu = backgroundMenu
+        menu.addItem(backgroundItem)
+
+        let accentMenu = NSMenu()
+        for color in ["Purple", "Blue", "Pink", "Orange", "Green", "System"] {
+            addChoice(color, key: "accentColor", value: color, selected: CompanionPreferences.accent == color, to: accentMenu)
+        }
+        let accentItem = NSMenuItem(title: "Accent", action: nil, keyEquivalent: "")
+        accentItem.submenu = accentMenu
+        menu.addItem(accentItem)
+        menu.addItem(NSMenuItem.separator())
+
+        func addToggle(_ title: String, key: String, value: Bool) {
+            let item = NSMenuItem(title: title, action: #selector(menuToggleChanged(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = key
+            item.state = value ? .on : .off
+            menu.addItem(item)
+        }
+        addToggle("Show only occupied workspaces", key: "occupiedOnly", value: CompanionPreferences.occupiedOnly)
+        addToggle("Show app icons", key: "showIcons", value: CompanionPreferences.showIcons)
+        addToggle("Show workspace labels", key: "showLabels", value: CompanionPreferences.showLabels)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "About Companion", action: #selector(showAbout), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Quit Companion", action: #selector(quit), keyEquivalent: "q").target = self
+        return menu
+    }
+
+    @objc private func menuChoiceChanged(_ item: NSMenuItem) {
+        guard let values = item.representedObject as? [String], values.count == 2 else { return }
+        let value: Any = values[0] == "stripSize" ? (Double(values[1]) ?? 22) : values[1]
+        CompanionPreferences.save(values[0], value)
+        strip?.contextMenu = makeContextMenu()
+    }
+
+    @objc private func menuToggleChanged(_ item: NSMenuItem) {
+        guard let key = item.representedObject as? String else { return }
+        CompanionPreferences.save(key, item.state != .on)
+        strip?.contextMenu = makeContextMenu()
+    }
+
     @objc private func preferencesChanged() {
         stripHeightConstraint?.constant = CompanionPreferences.size
-        strip?.update(workspaces: currentWorkspaces) { [weak self] name in
-            self?.client.focus(name)
-            self?.scheduleRefresh()
-        }
-        statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
-        refresh()
+        renderWorkspaces()
     }
 
     @objc private func applicationLifecycleChanged(_ notification: Notification) { scheduleRefresh() }
 
-    private func refresh() {
-        guard let latest = client.snapshot() else { return }
-        guard latest != currentWorkspaces else {
-            strip?.update(workspaces: latest) { [weak self] name in
-                self?.client.focus(name)
-                self?.scheduleRefresh()
-            }
-            statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
-            return
-        }
-        currentWorkspaces = latest
-        strip?.update(workspaces: latest) { [weak self] name in
-            self?.client.focus(name)
-            self?.scheduleRefresh()
+    private func renderWorkspaces() {
+        strip?.update(workspaces: currentWorkspaces) { [weak self] name in
+            guard let self else { return }
+            DispatchQueue.global(qos: .userInteractive).async { [client = self.client] in client.focus(name) }
+            self.scheduleRefresh()
         }
         statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
+    }
+
+    private func refresh() {
+        guard !isRefreshing else { refreshPending = true; return }
+        isRefreshing = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, client] in
+            let latest = client.snapshot()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isRefreshing = false
+                if let latest, latest != self.currentWorkspaces {
+                    self.currentWorkspaces = latest
+                    self.renderWorkspaces()
+                }
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.refresh()
+                }
+            }
+        }
     }
 
     private func scheduleRefresh() {
         refreshWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.refresh() }
         refreshWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
     }
 
     private func startEventStream() {
