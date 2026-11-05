@@ -1,5 +1,7 @@
 # Companion
 
+**Version 0.3 Beta** — build 3.
+
 A compact native macOS menu-bar companion for AeroSpace. It adds a small workspace island to the existing macOS menu bar; it does not replace the menu bar or create a separate full-width bar.
 
 ## Interface
@@ -40,7 +42,7 @@ bash scripts/build-app.sh release
 
 The app bundle is created at build/Companion.app.
 
-GitHub Actions builds the app on an Apple Silicon macOS 26 runner and uploads a ZIP artifact when the build and bundle verification succeed.
+GitHub Actions builds the app on an Apple Silicon macOS 26 runner, verifies bundle version 0.3 (build 3), and uploads `Companion-macOS-0.3-beta.zip` when the build and bundle verification succeed.
 
 ## Validation
 
