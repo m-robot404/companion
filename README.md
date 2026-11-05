@@ -1,30 +1,41 @@
 # Companion
 
-A lightweight native macOS menu bar companion for AeroSpace.
+A small native macOS menu-bar companion for AeroSpace. It adds a compact workspace indicator to the existing macOS menu bar; it does not replace the menu bar or create a separate bar.
 
-Companion displays AeroSpace workspaces as compact rounded compartments in the existing macOS menu bar. Each compartment shows its workspace name and the real application icons for windows in that workspace.
+## Interface
 
-## Goals
+- Adjacent rounded-rectangle workspace compartments, sized for the native menu-bar height.
+- Workspace letter plus real macOS application icons for windows in that workspace.
+- Restrained active-workspace treatment using the macOS glass material.
+- Click a compartment to switch to that AeroSpace workspace.
+- Up to three app icons per compartment, followed by a count when more apps are present.
 
-- Native AppKit menu bar item; does not replace the macOS menu bar.
-- Compact, train-car-style workspace compartments.
-- Real macOS application icons, cached between updates.
-- Click a compartment to switch workspace.
-- Lightweight periodic refresh in the first prototype; event-driven updates are a planned optimization.
-- Minimal idle CPU and memory use.
-- No third-party runtime dependencies.
+## Implementation
 
-## Status
-
-Initial prototype committed. CI compilation, live AeroSpace integration, menu-bar sizing, and memory usage still need validation.
+- Native Swift, SwiftUI, and AppKit; no third-party runtime dependencies.
+- Uses an `NSStatusItem` custom view in the existing system menu bar.
+- Reads workspace/window state from the AeroSpace CLI.
+- Uses AeroSpace's `subscribe` event stream for focus, workspace, monitor, and newly detected window changes. The stream reconnects if AeroSpace restarts.
+- Caches application icons with a bounded in-memory cache.
+- No continuous polling loop.
 
 ## Requirements
 
-- macOS 26 or later for the Liquid Glass appearance (the app should retain a restrained fallback appearance on older supported systems).
-- AeroSpace installed and its CLI available at `~/.local/bin/aerospace` or on the login shell PATH.
+- macOS 26 or later.
+- AeroSpace installed and its CLI available at `~/.local/bin/aerospace`, `/opt/homebrew/bin/aerospace`, or `/usr/local/bin/aerospace`.
 
 ## Build
 
-Open `Companion.xcodeproj` in Xcode and build the `Companion` scheme.
+Run:
 
-A GitHub Actions workflow will build the app on an Apple Silicon macOS runner and publish a ZIP artifact.
+```sh
+bash scripts/build-app.sh release
+```
+
+The app bundle is created at `build/Companion.app`.
+
+GitHub Actions builds the app on an Apple Silicon macOS 26 runner and uploads a ZIP artifact when the build and bundle verification succeed.
+
+## Current validation status
+
+The repository contains the first implementation. The CI build and live behavior still need to pass validation before this should be treated as a release.
