@@ -705,6 +705,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         spacingItem.submenu = spacingMenu
         menu.addItem(spacingItem)
 
+        let iconSpacingMenu = NSMenu()
+        for value in [1, 2, 3, 4, 5, 6, 8] {
+            addChoice("\(value) pt", key: "iconSpacing", value: "\(value)",
+                      selected: Int(CompanionPreferences.iconSpacing) == value, to: iconSpacingMenu)
+        }
+        let iconSpacingItem = NSMenuItem(title: "App Icon Spacing", action: nil, keyEquivalent: "")
+        iconSpacingItem.submenu = iconSpacingMenu
+        menu.addItem(iconSpacingItem)
+
         let opacityMenu = NSMenu()
         for value in [45, 60, 75, 82, 90, 100] {
             addChoice("\(value)%", key: "inactiveIconOpacity", value: String(Double(value) / 100),
