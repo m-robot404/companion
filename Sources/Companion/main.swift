@@ -1,7 +1,6 @@
 import AppKit
 import CoreGraphics
-import IOKit
-import MachO
+import Darwin
 
 private enum CompanionPreferences {
     enum Background: String, CaseIterable {
@@ -32,7 +31,7 @@ private enum CompanionPreferences {
         CGFloat(defaults.object(forKey: "inactiveIconOpacity") as? Double ?? 0.82)
     }
     static var backgroundOpacity: CGFloat {
-        CGFloat(defaults.object(forKey: "backgroundOpacity") as? Double ?? 0.18)
+        CGFloat(defaults.object(forKey: "backgroundOpacity") as? Double ?? 0.92)
     }
 
     static var accentColor: NSColor {
@@ -462,8 +461,8 @@ private final class WorkspaceStripView: NSView {
                 let glass = NSGlassEffectView(frame: frame)
                 glass.cornerRadius = 9 * scale
                 glass.tintColor = workspace.isFocused
-                    ? CompanionPreferences.accentColor.withAlphaComponent(0.22)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)
+                    ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
+                    : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
                 glass.contentView = content
                 background = glass
             } else {
@@ -510,7 +509,7 @@ private final class CompartmentBackgroundView: NSView {
                                 xRadius: 9 * CompanionPreferences.size / 22,
                                 yRadius: 9 * CompanionPreferences.size / 22)
         if style == .solid {
-            (focused ? CompanionPreferences.accentColor.withAlphaComponent(min(1, CompanionPreferences.backgroundOpacity + 0.2))
+            (focused ? CompanionPreferences.accentColor.withAlphaComponent(min(1, CompanionPreferences.backgroundOpacity + 0.08))
                      : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)).setFill()
             path.fill()
         }
@@ -610,6 +609,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = AeroSpaceClient()
     private var statusItem: NSStatusItem?
     private var strip: WorkspaceStripView?
+    private var statsPopoverController: SystemStatsPopoverController?
     private var stripHeightConstraint: NSLayoutConstraint?
     private var eventProcess: Process?
     private var eventPipe: Pipe?
@@ -659,6 +659,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showAbout() { NSApp.orderFrontStandardAboutPanel(nil) }
     @objc private func showSystemStats() {
         let controller = SystemStatsPopoverController()
+        statsPopoverController = controller
         controller.show(from: statusItem?.button)
     }
     @objc private func quit() { NSApp.terminate(nil) }
@@ -724,7 +725,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(opacityItem)
 
         let backgroundOpacityMenu = NSMenu()
-        for value in [5, 10, 18, 25, 35, 50, 70, 100] {
+        for value in [10, 20, 35, 50, 65, 80, 92, 100] {
             addChoice("\(value)%", key: "backgroundOpacity", value: String(Double(value) / 100),
                       selected: Int(CompanionPreferences.backgroundOpacity * 100) == value, to: backgroundOpacityMenu)
         }
@@ -759,7 +760,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuChoiceChanged(_ item: NSMenuItem) {
         guard let values = item.representedObject as? [String], values.count == 2 else { return }
         let value: Any
-        if ["stripSize", "workspaceSpacing", "inactiveIconOpacity", "backgroundOpacity"].contains(values[0]) {
+        if ["stripSize", "workspaceSpacing", "iconSpacing", "inactiveIconOpacity", "backgroundOpacity"].contains(values[0]) {
             value = Double(values[1]) ?? 22
         } else { value = values[1] }
         CompanionPreferences.save(values[0], value)
