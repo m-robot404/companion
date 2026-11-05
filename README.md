@@ -9,7 +9,7 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 - Click a workspace compartment to switch workspaces.
 - Click a single app icon to focus that exact AeroSpace window. Click a grouped icon to choose a specific window from a menu.
 - Repeated windows from the same app are grouped with a count badge.
-- Hover an app icon for a lightweight window preview. A captured thumbnail is shown only when Screen Recording permission is already available; otherwise the preview falls back to the app icon and window title. Companion does not request Screen Recording permission automatically.
+- Hover an app icon for a lightweight window preview. Window thumbnails use ScreenCaptureKit and require Screen Recording permission; if macOS denies capture or the target window is unavailable, the preview retains the app icon and window title.
 - A right-click on the strip opens controls for size, workspace spacing, app-icon spacing, background, background opacity, inactive-icon opacity, accent, occupied-only filtering, labels, icons, system stats, About, and Quit.
 - System Stats opens on demand and samples system CPU, memory, and Companion's physical footprint; it does not run a background polling loop.
 - The status item uses AppKit's native menu-bar placement and saves its position. macOS handles the built-in notch exclusion and available status-item area; Companion does not create an overlay window or move itself across the notch.
@@ -20,7 +20,7 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 - AeroSpace CLI snapshot reads workspace/window IDs, app bundle IDs, app names, and window titles.
 - AeroSpace's subscribe event stream drives updates and reconnects if AeroSpace restarts.
 - App icons use a bounded NSCache.
-- Window thumbnails are captured on hover only, only if Screen Recording permission is already granted, and are not retained in a persistent cache.
+- Window thumbnails are captured on hover only through ScreenCaptureKit and are not retained in a persistent cache.
 - System CPU and memory statistics are sampled only when the user opens the stats popover.
 - No continuous polling loop.
 
