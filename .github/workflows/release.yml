@@ -9,7 +9,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: v0.1-beta
+        default: v0.2-beta
 
 permissions:
   contents: write
@@ -27,17 +27,17 @@ jobs:
           plutil -lint build/Companion.app/Contents/Info.plist
           test -s build/Companion.app/Contents/Resources/AppIcon.icns
           codesign --verify --deep --strict build/Companion.app
-          test "$(defaults read "$PWD/build/Companion.app/Contents/Info" CFBundleShortVersionString)" = "0.1"
+          test "$(defaults read "$PWD/build/Companion.app/Contents/Info" CFBundleShortVersionString)" = "0.2"
       - name: Package release
-        run: ditto -c -k --sequesterRsrc --keepParent build/Companion.app Companion-macOS-0.1-beta.zip
+        run: ditto -c -k --sequesterRsrc --keepParent build/Companion.app Companion-macOS-0.2-beta.zip
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v2
         with:
-          name: Companion 0.1 Beta
+          name: Companion 0.2 Beta
           tag_name: ${{ inputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
           body: |
-            Companion 0.1 Beta
+            Companion 0.2 Beta
 
             Native macOS menu-bar workspace companion for AeroSpace.
 
@@ -45,7 +45,7 @@ jobs:
             - Apple Silicon build
             - Ad-hoc signed; not Developer ID signed or notarized
             - Screen Recording permission is optional and only needed for window thumbnails
-          files: Companion-macOS-0.1-beta.zip
+          files: Companion-macOS-0.2-beta.zip
           prerelease: true
           make_latest: false
           generate_release_notes: true
