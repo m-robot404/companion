@@ -212,8 +212,10 @@ private actor WindowPreviewSource {
     private var windowsByID: [CGWindowID: SCWindow] = [:]
     private var refreshedAt = Date.distantPast
     private var thumbnails: [CGWindowID: CGImage] = [:]
+    private var thumbnailDates: [CGWindowID: Date] = [:]
     private var thumbnailOrder: [CGWindowID] = []
     private let cacheLimit = 24
+    private let thumbnailFreshness: TimeInterval = 2.5
 
     private func refreshWindowMap() async {
         guard Date().timeIntervalSince(refreshedAt) >= 1 || windowsByID.isEmpty else { return }
@@ -248,11 +250,17 @@ private actor WindowPreviewSource {
             if target == nil && candidates.count == 1 { target = candidates[0] }
         }
         guard let target else { return nil }
-        if !target.isOnScreen, let cached = thumbnails[id] { return cached }
+        if let cached = thumbnails[id],
+           let capturedAt = thumbnailDates[id],
+           Date().timeIntervalSince(capturedAt) < thumbnailFreshness {
+            return cached
+        }
 
         let sourceWidth = max(1, target.frame.width)
         let sourceHeight = max(1, target.frame.height)
-        let scale = min(1, min(480 / sourceWidth, 270 / sourceHeight))
+        // Small menu-bar previews do not need retina-sized captures. Keeping the
+        // source near the actual display size avoids expensive GPU readback/scaling.
+        let scale = min(1, min(320 / sourceWidth, 180 / sourceHeight))
         let configuration = SCStreamConfiguration()
         configuration.width = max(1, Int(sourceWidth * scale))
         configuration.height = max(1, Int(sourceHeight * scale))
@@ -265,10 +273,13 @@ private actor WindowPreviewSource {
                 configuration: configuration
             )
             thumbnails[id] = image
+            thumbnailDates[id] = Date()
             thumbnailOrder.removeAll { $0 == id }
             thumbnailOrder.append(id)
             while thumbnailOrder.count > cacheLimit {
-                thumbnails[thumbnailOrder.removeFirst()] = nil
+                let evicted = thumbnailOrder.removeFirst()
+                thumbnails[evicted] = nil
+                thumbnailDates[evicted] = nil
             }
             return image
         } catch {
@@ -299,7 +310,7 @@ private final class PreviewHoverHostView: NSView {
 
 @MainActor
 private final class WorkspaceContentView: NSView {
-    let workspace: Workspace
+    var workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
     private var previewPopover: NSPopover?
@@ -319,6 +330,15 @@ private final class WorkspaceContentView: NSView {
         installIconHitTargets()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func updateWorkspace(_ updated: Workspace) {
+        let iconsChanged = workspace.windows != updated.windows
+        workspace = updated
+        if iconsChanged { installIconHitTargets() }
+        setAccessibilityLabel("Workspace \(updated.name), \(updated.windows.count) windows")
+        needsDisplay = true
+    }
+
     override var isFlipped: Bool { true }
 
     private var scale: CGFloat { CompanionPreferences.size / 22 }
@@ -536,7 +556,12 @@ private final class WorkspaceStripView: NSView {
     private var glassContainer: NSGlassEffectContainerView?
     private var selection: ((String) -> Void)?
     private var compartmentViews: [NSView] = []
+    private var contentViews: [WorkspaceContentView] = []
+    private var workspaceBackgrounds: [NSView] = []
+    private var forceLayoutRebuild = false
     var contextMenu: NSMenu?
+
+    func invalidateWorkspaceLayout() { forceLayoutRebuild = true }
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: measuredWidth, height: CompanionPreferences.size)
@@ -585,10 +610,34 @@ private final class WorkspaceStripView: NSView {
             : workspaces
         selection = onSelect
         focusWindow = onFocusWindow
+
+        let sameStructure = !forceLayoutRebuild &&
+            self.workspaces.count == self.workspaces.count &&
+            self.workspaces.map(\.name) == self.workspaces.map(\.name) &&
+            zip(self.workspaces, self.workspaces).allSatisfy { $0.windows == $1.windows }
+        if sameStructure && contentViews.count == self.workspaces.count {
+            for index in self.workspaces.indices {
+                let workspace = self.workspaces[index]
+                contentViews[index].updateWorkspace(workspace)
+                if let glass = workspaceBackgrounds[index] as? PassthroughGlassEffectView {
+                    glass.tintColor = workspace.isFocused
+                        ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
+                        : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
+                } else if let background = workspaceBackgrounds[index] as? CompartmentBackgroundView {
+                    background.updateFocus(workspace.isFocused)
+                }
+            }
+            forceLayoutRebuild = false
+            return
+        }
+
+        forceLayoutRebuild = false
         glassContainer?.removeFromSuperview()
         glassContainer = nil
         compartmentViews.forEach { $0.removeFromSuperview() }
         compartmentViews.removeAll()
+        contentViews.removeAll()
+        workspaceBackgrounds.removeAll()
 
         let height = CompanionPreferences.size
         let scale = height / 22
@@ -622,6 +671,8 @@ private final class WorkspaceStripView: NSView {
             contentHost.addSubview(background)
             contentHost.addSubview(content)
             compartmentViews.append(background)
+            contentViews.append(content)
+            workspaceBackgrounds.append(background)
             x += frame.width + gap
         }
 
@@ -639,7 +690,7 @@ private final class PassthroughGlassEffectView: NSGlassEffectView {
 
 @MainActor
 private final class CompartmentBackgroundView: NSView {
-    private let focused: Bool
+    private var focused: Bool
     private let style: CompanionPreferences.Background
     init(frame: NSRect, focused: Bool, style: CompanionPreferences.Background) {
         self.focused = focused
@@ -648,6 +699,11 @@ private final class CompartmentBackgroundView: NSView {
         wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func updateFocus(_ value: Bool) {
+        guard focused != value else { return }
+        focused = value
+        needsDisplay = true
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
@@ -920,6 +976,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func preferencesChanged() {
         stripHeightConstraint?.constant = CompanionPreferences.size
+        strip?.invalidateWorkspaceLayout()
         renderWorkspaces()
     }
 
