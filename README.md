@@ -23,10 +23,11 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 - Native Swift and AppKit; no SwiftUI, Electron, WebView, or third-party runtime dependencies.
 - AeroSpace CLI snapshot reads workspace/window IDs, app bundle IDs, app names, and window titles.
 - AeroSpace's subscribe event stream drives updates and reconnects if AeroSpace restarts.
+- While app icons are visible, Companion reconciles the live window list every 1.25 seconds as a fallback because AeroSpace does not publish a documented window-closed event. Reconciliation stops when no windows remain or icons are disabled.
 - App icons use a bounded NSCache.
 - Window thumbnails are captured on hover through ScreenCaptureKit and kept in a small, time-limited in-memory cache.
 - System CPU and memory statistics are sampled only when the user opens the stats popover.
-- No continuous polling loop.
+- No always-on polling loop; the bounded reconciliation timer runs only while app icons are visible.
 
 ## Requirements
 
@@ -36,7 +37,7 @@ A compact native macOS menu-bar companion for AeroSpace. It adds a small workspa
 
 ## Build
 
-This beta is version `0.1` (build `1`).
+This beta is version `0.2` (build `2`).
 
 Run:
 
