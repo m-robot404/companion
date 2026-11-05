@@ -19,13 +19,15 @@ jobs:
           plutil -lint build/Companion.app/Contents/Info.plist
           test -s build/Companion.app/Contents/Resources/AppIcon.icns
           codesign --verify --deep --strict build/Companion.app
+          test "$(defaults read "$PWD/build/Companion.app/Contents/Info" CFBundleShortVersionString)" = "0.3"
+          test "$(defaults read "$PWD/build/Companion.app/Contents/Info" CFBundleVersion)" = "3"
       - name: Package app bundle
         run: |
-          ditto -c -k --sequesterRsrc --keepParent build/Companion.app build/Companion-macOS.zip
-          unzip -l build/Companion-macOS.zip | grep -q 'Companion.app/Contents/MacOS/Companion'
+          ditto -c -k --sequesterRsrc --keepParent build/Companion.app build/Companion-macOS-0.3-beta.zip
+          unzip -l build/Companion-macOS-0.3-beta.zip | grep -q 'Companion.app/Contents/MacOS/Companion'
       - uses: actions/upload-artifact@v4
         with:
-          name: Companion-macOS
-          path: build/Companion-macOS.zip
+          name: Companion-macOS-0.3-beta
+          path: build/Companion-macOS-0.3-beta.zip
           if-no-files-found: error
           retention-days: 14
