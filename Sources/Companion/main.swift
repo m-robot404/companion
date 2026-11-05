@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Darwin
+import ScreenCaptureKit
 
 private enum CompanionPreferences {
     enum Background: String, CaseIterable {
@@ -327,8 +328,12 @@ private final class WorkspaceContentView: NSView {
         host.layer?.cornerRadius = 10
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
         imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.image = previewImage(for: group.windows[0]) ??
-            AppIconCache.shared.image(for: group.bundleID, size: 64)
+        imageView.image = AppIconCache.shared.image(for: group.bundleID, size: 64)
+        Task { @MainActor [weak self, weak imageView] in
+            guard let self, let imageView,
+                  let captured = await self.previewImage(for: group.windows[0]) else { return }
+            imageView.image = captured
+        }
         host.addSubview(imageView)
         let title = NSTextField(labelWithString: group.windows[0].title)
         title.frame = NSRect(x: 12, y: 10, width: 208, height: 20)
@@ -349,12 +354,23 @@ private final class WorkspaceContentView: NSView {
         previewPopover = popover
     }
 
-    private func previewImage(for window: WorkspaceWindow) -> NSImage? {
-        guard CGPreflightScreenCaptureAccess(),
-              let id = UInt32(window.id),
-              let image = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(id), [.bestResolution])
-        else { return nil }
-        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
+        guard CGPreflightScreenCaptureAccess(), let id = UInt32(window.id) else { return nil }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let target = content.windows.first(where: { $0.windowID == CGWindowID(id) }) else { return nil }
+            let filter = SCContentFilter(desktopIndependentWindow: target)
+            let configuration = SCStreamConfiguration()
+            configuration.width = 480
+            configuration.height = 270
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        } catch {
+            return nil
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -566,7 +582,7 @@ private final class SystemStatsPopoverController: NSObject {
 
     private func cpuTicks() -> [UInt32]? {
         var info = host_cpu_load_info_data_t()
-        var count = mach_msg_type_number_t(HOST_CPU_LOAD_INFO_COUNT)
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
                 host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
