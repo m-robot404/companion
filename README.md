@@ -1,6 +1,6 @@
 # Companion
 
-**Version 0.1 Beta** — early preview release.
+**Version 0.2 Beta** — early preview release.
 
 A compact native macOS menu-bar companion for AeroSpace. It adds a small workspace island to the existing macOS menu bar; it does not replace the menu bar or create a separate full-width bar.
 
