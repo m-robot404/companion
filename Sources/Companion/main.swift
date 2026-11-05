@@ -226,11 +226,13 @@ private actor WindowPreviewSource {
     }
 
     func capture(_ window: WorkspaceWindow) async -> CGImage? {
-        guard let rawID = UInt32(window.id.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        let rawValue = window.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedID = rawValue.hasPrefix("0x")
+            ? UInt32(rawValue.dropFirst(2), radix: 16)
+            : UInt32(rawValue)
+        guard let rawID = parsedID else { return nil }
         let id = CGWindowID(rawID)
         await refreshWindowMap()
-
-        if let cached = thumbnails[id] { return cached }
 
         // Prefer AeroSpace's exact CGWindowID. If ScreenCaptureKit's map is temporarily
         // out of sync, use a unique bundle-ID + title match; never guess between windows.
@@ -246,10 +248,11 @@ private actor WindowPreviewSource {
             if target == nil && candidates.count == 1 { target = candidates[0] }
         }
         guard let target else { return nil }
+        if !target.isOnScreen, let cached = thumbnails[id] { return cached }
 
         let sourceWidth = max(1, target.frame.width)
         let sourceHeight = max(1, target.frame.height)
-        let scale = min(1, 480 / sourceWidth, 270 / sourceHeight)
+        let scale = min(1, min(480 / sourceWidth, 270 / sourceHeight))
         let configuration = SCStreamConfiguration()
         configuration.width = max(1, Int(sourceWidth * scale))
         configuration.height = max(1, Int(sourceHeight * scale))
@@ -272,6 +275,26 @@ private actor WindowPreviewSource {
             return nil
         }
     }
+}
+
+@MainActor
+private final class PreviewHoverHostView: NSView {
+    var onEnter: (() -> Void)?
+    var onExit: (() -> Void)?
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter?() }
+    override func mouseExited(with event: NSEvent) { onExit?() }
 }
 
 @MainActor
@@ -429,6 +452,7 @@ private final class WorkspaceContentView: NSView {
         previewDismissWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.previewDismissWorkItem = nil
             let pointer = NSEvent.mouseLocation
             if self.previewPopover?.contentViewController?.view.window?.frame.contains(pointer) == true {
                 return
@@ -450,7 +474,12 @@ private final class WorkspaceContentView: NSView {
         let popover = NSPopover()
         popover.behavior = .applicationDefined
         let controller = NSViewController()
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        let host = PreviewHoverHostView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        host.onEnter = { [weak self] in
+            self?.previewDismissWorkItem?.cancel()
+            self?.previewDismissWorkItem = nil
+        }
+        host.onExit = { [weak self] in self?.schedulePreviewDismissal() }
         host.wantsLayer = true
         host.layer?.cornerRadius = 10
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
