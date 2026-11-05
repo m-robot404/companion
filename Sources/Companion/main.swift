@@ -431,14 +431,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-private final class CompanionApplication: NSObject, NSApplicationDelegate {
-    private var delegate: AppDelegate?
-
+private enum CompanionApplication {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
-        let applicationDelegate = CompanionApplication()
-        applicationDelegate.delegate = delegate
         app.delegate = delegate
         app.run()
     }
