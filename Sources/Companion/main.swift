@@ -231,7 +231,7 @@ private actor WindowPreviewSource {
     private var thumbnails: [CGWindowID: CGImage] = [:]
     private var thumbnailDates: [CGWindowID: Date] = [:]
     private var thumbnailOrder: [CGWindowID] = []
-    private let cacheLimit = 24
+    private let cacheLimit = 12
     private let thumbnailFreshness: TimeInterval = 2.5
 
     private func refreshWindowMap() async {
@@ -275,9 +275,9 @@ private actor WindowPreviewSource {
 
         let sourceWidth = max(1, target.frame.width)
         let sourceHeight = max(1, target.frame.height)
-        // Small menu-bar previews do not need retina-sized captures. Keeping the
-        // source near the actual display size avoids expensive GPU readback/scaling.
-        let scale = min(1, min(320 / sourceWidth, 180 / sourceHeight))
+        // Small menu-bar previews do not need retina-sized captures. A strict 240×135
+        // cap and 12-entry LRU bound keep capture and retained image memory low.
+        let scale = min(1, min(240 / sourceWidth, 135 / sourceHeight))
         let configuration = SCStreamConfiguration()
         configuration.width = max(1, Int(sourceWidth * scale))
         configuration.height = max(1, Int(sourceHeight * scale))
