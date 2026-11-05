@@ -323,12 +323,11 @@ private final class WorkspaceContentView: NSView {
         super.init(frame: frame)
         setAccessibilityRole(.button)
         setAccessibilityLabel("Workspace \(workspace.name), \(workspace.windows.count) windows")
-        installIconHitTargets()
+        refreshIconHitTargets()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func updateWorkspace(_ updated: Workspace) {
-        let iconsChanged = workspace.windows != updated.windows
         workspace = updated
         refreshIconHitTargets()
         setAccessibilityLabel("Workspace \(updated.name), \(updated.windows.count) windows")
