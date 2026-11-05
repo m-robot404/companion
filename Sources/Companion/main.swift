@@ -306,33 +306,12 @@ private actor WindowPreviewSource {
 }
 
 @MainActor
-private final class PreviewHoverHostView: NSView {
-    var onEnter: (() -> Void)?
-    var onExit: (() -> Void)?
-    private var tracking: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { onEnter?() }
-    override func mouseExited(with event: NSEvent) { onExit?() }
-}
-
-@MainActor
 private final class WorkspaceContentView: NSView {
     var workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
     private var previewPopover: NSPopover?
     private weak var previewAnchor: NSView?
-    private var previewDismissWorkItem: DispatchWorkItem?
     private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
@@ -351,7 +330,7 @@ private final class WorkspaceContentView: NSView {
     func updateWorkspace(_ updated: Workspace) {
         let iconsChanged = workspace.windows != updated.windows
         workspace = updated
-        if iconsChanged { installIconHitTargets() }
+        refreshIconHitTargets()
         setAccessibilityLabel("Workspace \(updated.name), \(updated.windows.count) windows")
         needsDisplay = true
     }
@@ -441,22 +420,35 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    private func installIconHitTargets() {
-        iconHitViews.forEach { $0.removeFromSuperview() }
-        iconHitViews.removeAll()
-        for (frame, group) in iconFrames() {
-            let target = WorkspaceIconHitView(frame: frame)
+    private func refreshIconHitTargets() {
+        let items = iconFrames()
+        if iconHitViews.count > items.count {
+            for target in iconHitViews.suffix(iconHitViews.count - items.count) {
+                target.removeFromSuperview()
+            }
+            iconHitViews.removeLast(iconHitViews.count - items.count)
+        }
+
+        for (index, item) in items.enumerated() {
+            let (frame, group) = item
+            let target: WorkspaceIconHitView
+            if index < iconHitViews.count {
+                target = iconHitViews[index]
+                target.frame = frame
+            } else {
+                target = WorkspaceIconHitView(frame: frame)
+                addSubview(target)
+                iconHitViews.append(target)
+            }
+
+            // Rebind the latest group data without replacing the tracking view.
+            // Recreating a tracking view under a stationary pointer emits exit/enter
+            // events and makes the preview repeatedly close and reopen.
             target.onEnter = { [weak self] anchor in
-                self?.previewDismissWorkItem?.cancel()
-                self?.previewDismissWorkItem = nil
                 self?.showPreview(for: group, anchoredTo: anchor)
             }
             target.onExit = { [weak self, weak target] in
                 guard let self, self.previewAnchor === target else { return }
-                // The preview is a hover tooltip, not an interactive panel:
-                // dismiss it as soon as the pointer leaves the app icon.
-                self.previewDismissWorkItem?.cancel()
-                self.previewDismissWorkItem = nil
                 self.previewPopover?.close()
                 self.previewPopover = nil
                 self.previewAnchor = nil
@@ -467,8 +459,6 @@ private final class WorkspaceContentView: NSView {
             target.setAccessibilityRole(.button)
             target.setAccessibilityLabel(group.windows.count == 1
                 ? group.appName : "\(group.appName), \(group.windows.count) windows")
-            addSubview(target)
-            iconHitViews.append(target)
         }
     }
 
@@ -491,43 +481,6 @@ private final class WorkspaceContentView: NSView {
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    private func pointerIsInsidePreviewOrAnchor() -> Bool {
-        let pointer = NSEvent.mouseLocation
-
-        if previewPopover?.contentViewController?.view.window?.frame
-            .insetBy(dx: -8, dy: -8).contains(pointer) == true {
-            return true
-        }
-
-        // The icon and popover are separate windows. Keep the preview alive while
-        // the pointer travels between them, including the small gap between surfaces.
-        if let anchor = previewAnchor,
-           let window = anchor.window {
-            let anchorInWindow = anchor.convert(anchor.bounds, to: nil)
-            let anchorOnScreen = window.convertToScreen(anchorInWindow)
-            if anchorOnScreen.insetBy(dx: -8, dy: -8).contains(pointer) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func schedulePreviewDismissal() {
-        previewDismissWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.previewDismissWorkItem = nil
-            guard !self.pointerIsInsidePreviewOrAnchor() else { return }
-            self.previewPopover?.close()
-            self.previewPopover = nil
-            self.previewAnchor = nil
-        }
-        previewDismissWorkItem = work
-        // Give the pointer enough time to cross the gap from the menu-bar icon
-        // into the separate preview panel. Entering either surface cancels this.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
-    }
-
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
         previewDismissWorkItem?.cancel()
         previewDismissWorkItem = nil
@@ -536,12 +489,7 @@ private final class WorkspaceContentView: NSView {
         let popover = NSPopover()
         popover.behavior = .applicationDefined
         let controller = NSViewController()
-        let host = PreviewHoverHostView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
-        host.onEnter = { [weak self] in
-            self?.previewDismissWorkItem?.cancel()
-            self?.previewDismissWorkItem = nil
-        }
-        host.onExit = { [weak self] in self?.schedulePreviewDismissal() }
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
         host.wantsLayer = true
         host.layer?.cornerRadius = 10
         let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
@@ -655,12 +603,17 @@ private final class WorkspaceStripView: NSView {
 
         let sameStructure = !forceLayoutRebuild &&
             renderedWorkspaces.count == self.workspaces.count &&
-            renderedWorkspaces.map(\.name) == self.workspaces.map(\.name) &&
-            zip(renderedWorkspaces, self.workspaces).allSatisfy { $0.windows == $1.windows }
+            renderedWorkspaces.map(\.name) == self.workspaces.map(\.name)
         if sameStructure && contentViews.count == self.workspaces.count {
+            let height = CompanionPreferences.size
+            let scale = height / 22
+            var x: CGFloat = 6
             for index in self.workspaces.indices {
                 let workspace = self.workspaces[index]
+                let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
+                contentViews[index].frame = frame
                 contentViews[index].updateWorkspace(workspace)
+                workspaceBackgrounds[index].frame = frame
                 if let glass = workspaceBackgrounds[index] as? PassthroughGlassEffectView {
                     glass.tintColor = workspace.isFocused
                         ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
@@ -668,9 +621,14 @@ private final class WorkspaceStripView: NSView {
                 } else if let background = workspaceBackgrounds[index] as? CompartmentBackgroundView {
                     background.updateFocus(workspace.isFocused)
                 }
+                x += frame.width + gap
             }
+            railBase?.frame = NSRect(x: 0, y: 3 * scale,
+                                     width: measuredWidth, height: height - 6 * scale)
             renderedWorkspaces = self.workspaces
             forceLayoutRebuild = false
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
             return
         }
 
@@ -697,6 +655,7 @@ private final class WorkspaceStripView: NSView {
             if CompanionPreferences.background == .glass {
                 let glass = PassthroughGlassEffectView(frame: frame)
                 glass.cornerRadius = 8 * scale
+                glass.effectIsInteractive = false
                 glass.tintColor = workspace.isFocused
                     ? CompanionPreferences.accentColor.withAlphaComponent(0.26 * CompanionPreferences.backgroundOpacity)
                     : NSColor.controlBackgroundColor.withAlphaComponent(0.10 * CompanionPreferences.backgroundOpacity)
@@ -757,10 +716,17 @@ private final class CompartmentBackgroundView: NSView {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
                                 xRadius: 9 * CompanionPreferences.size / 22,
                                 yRadius: 9 * CompanionPreferences.size / 22)
-        if style == .solid {
+        switch style {
+        case .glass:
+            (focused ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
+                     : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)).setFill()
+            path.fill()
+        case .solid:
             (focused ? CompanionPreferences.accentColor.withAlphaComponent(min(1, CompanionPreferences.backgroundOpacity + 0.08))
                      : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)).setFill()
             path.fill()
+        case .transparent:
+            break
         }
         if focused {
             CompanionPreferences.accentColor.withAlphaComponent(0.7).setStroke()
@@ -874,10 +840,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: 1)
         item.autosaveName = "com.m-robot404.Companion.workspaceStrip"
+        item.highlightMode = false
         statusItem = item
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
+        button.cell?.highlightsBy = []
 
         let strip = WorkspaceStripView(frame: NSRect(x: 0, y: 0, width: 1, height: CompanionPreferences.size))
         strip.translatesAutoresizingMaskIntoConstraints = false
