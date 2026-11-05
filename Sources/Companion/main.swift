@@ -435,6 +435,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var controlsItem: NSStatusItem?
     private var strip: WorkspaceStripView?
+    private var stripHeightConstraint: NSLayoutConstraint?
     private var eventProcess: Process?
     private var eventPipe: Pipe?
     private var eventBuffer = ""
@@ -460,6 +461,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             strip.centerYAnchor.constraint(equalTo: button.centerYAnchor),
             strip.heightAnchor.constraint(equalToConstant: CompanionPreferences.size)
         ])
+        stripHeightConstraint = strip.constraints.first { $0.firstAttribute == .height }
         self.strip = strip
 
         let controls = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -490,6 +492,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showAbout() { NSApp.orderFrontStandardAboutPanel(nil) }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func preferencesChanged() {
+        stripHeightConstraint?.constant = CompanionPreferences.size
         strip?.update(workspaces: currentWorkspaces) { [weak self] name in
             self?.client.focus(name)
             self?.scheduleRefresh()
