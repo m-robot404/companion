@@ -117,11 +117,25 @@ private final class AeroSpaceClient {
     }
 
     func snapshot() -> [Workspace]? {
-        guard
-            let workspaceText = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
-            let windowText = run(["list-windows", "--all", "--format",
+        let group = DispatchGroup()
+        let resultLock = NSLock()
+        var workspaceText: String?
+        var windowText: String?
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = self.run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"])
+            resultLock.lock(); workspaceText = value; resultLock.unlock()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = self.run(["list-windows", "--all", "--format",
                                   "%{window-id}%{tab}%{app-bundle-id}%{tab}%{app-name}%{tab}%{window-title}%{tab}%{workspace}"])
-        else { return nil }
+            resultLock.lock(); windowText = value; resultLock.unlock()
+            group.leave()
+        }
+        group.wait()
+        guard let workspaceText, let windowText else { return nil }
 
         var windows: [String: [WorkspaceWindow]] = [:]
         for line in windowText.split(whereSeparator: \.isNewline) {
@@ -553,12 +567,12 @@ private final class WorkspaceContentView: NSView {
 @MainActor
 private final class WorkspaceStripView: NSView {
     private var workspaces: [Workspace] = []
-    private var glassContainer: NSGlassEffectContainerView?
     private var selection: ((String) -> Void)?
-    private var compartmentViews: [NSView] = []
+    private var focusWindow: ((String) -> Void)?
     private var contentViews: [WorkspaceContentView] = []
     private var workspaceBackgrounds: [NSView] = []
     private var renderedWorkspaces: [Workspace] = []
+    private var railBase: RailBaseView?
     private var forceLayoutRebuild = false
     var contextMenu: NSMenu?
 
@@ -573,11 +587,12 @@ private final class WorkspaceStripView: NSView {
         NSMenu.popUpContextMenu(contextMenu, with: event, for: self)
     }
 
-    private var gap: CGFloat { CompanionPreferences.workspaceSpacing * CompanionPreferences.size / 22 }
+    private var gap: CGFloat { max(5, CompanionPreferences.workspaceSpacing * CompanionPreferences.size / 22) }
+
     private var measuredWidth: CGFloat {
         guard !workspaces.isEmpty else { return 1 }
         return workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
-            + CGFloat(max(0, workspaces.count - 1)) * gap + 4
+            + CGFloat(max(0, workspaces.count - 1)) * gap + 12
     }
 
     private func compartmentWidth(for workspace: Workspace) -> CGFloat {
@@ -598,11 +613,9 @@ private final class WorkspaceStripView: NSView {
                 ]).width)
             }
         }
-        if !workspace.windows.isEmpty { width = max(width, 44 * scale) }
-        return ceil(max(24 * scale, width))
+        if !workspace.windows.isEmpty { width = max(width, 36 * scale) }
+        return ceil(max(22 * scale, width))
     }
-
-    private var focusWindow: ((String) -> Void)?
 
     func update(workspaces: [Workspace], onSelect: @escaping (String) -> Void,
                 onFocusWindow: @escaping (String) -> Void) {
@@ -634,55 +647,59 @@ private final class WorkspaceStripView: NSView {
         }
 
         forceLayoutRebuild = false
-        glassContainer?.removeFromSuperview()
-        glassContainer = nil
-        compartmentViews.forEach { $0.removeFromSuperview() }
-        compartmentViews.removeAll()
+        subviews.forEach { $0.removeFromSuperview() }
         contentViews.removeAll()
         workspaceBackgrounds.removeAll()
+        railBase = nil
 
         let height = CompanionPreferences.size
         let scale = height / 22
-        let contentHost = NSView(frame: NSRect(x: 0, y: 0, width: measuredWidth, height: height))
-        var x: CGFloat = 2
+        let base = RailBaseView(frame: NSRect(x: 0, y: 3 * scale,
+                                               width: measuredWidth, height: height - 6 * scale))
+        addSubview(base, positioned: .below, relativeTo: nil)
+        railBase = base
 
+        var x: CGFloat = 6
         for workspace in self.workspaces {
             let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
-            let content = WorkspaceContentView(workspace: workspace, frame: NSRect(origin: .zero, size: frame.size),
+            let content = WorkspaceContentView(workspace: workspace, frame: frame,
                                                 onSelect: onSelect,
                                                 onFocusWindow: { [weak self] id in self?.focusWindow?(id) })
             let background: NSView
             if CompanionPreferences.background == .glass {
                 let glass = PassthroughGlassEffectView(frame: frame)
-                glass.cornerRadius = 9 * scale
+                glass.cornerRadius = 8 * scale
                 glass.tintColor = workspace.isFocused
-                    ? CompanionPreferences.accentColor.withAlphaComponent(0.22 * CompanionPreferences.backgroundOpacity)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.08 * CompanionPreferences.backgroundOpacity)
+                    ? CompanionPreferences.accentColor.withAlphaComponent(0.26 * CompanionPreferences.backgroundOpacity)
+                    : NSColor.controlBackgroundColor.withAlphaComponent(0.10 * CompanionPreferences.backgroundOpacity)
                 background = glass
             } else {
                 background = CompartmentBackgroundView(frame: frame, focused: workspace.isFocused,
                                                        style: CompanionPreferences.background)
             }
-            // Position the interactive view in the same strip coordinates as its
-            // background. Leaving its origin at zero stacks every workspace's hit
-            // targets over the first compartment.
-            content.frame = frame
-            content.autoresizingMask = [.height]
-            // Backgrounds are non-interactive siblings. Each icon hit target remains
-            // independent instead of being swallowed by a glass container's hit area.
-            contentHost.addSubview(background)
-            contentHost.addSubview(content)
-            compartmentViews.append(background)
+            // Each island is an independent sibling over the continuous rail.
+            // Its background never owns hit testing; only its own icon targets do.
+            addSubview(background)
+            addSubview(content)
             contentViews.append(content)
             workspaceBackgrounds.append(background)
             x += frame.width + gap
         }
 
-        addSubview(contentHost)
-        compartmentViews.append(contentHost)
         renderedWorkspaces = self.workspaces
         invalidateIntrinsicContentSize()
         needsDisplay = true
+    }
+}
+
+@MainActor
+private final class RailBaseView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        let radius = bounds.height / 2
+        let path = NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius)
+        NSColor.controlBackgroundColor.withAlphaComponent(0.18).setFill()
+        path.fill()
     }
 }
 
@@ -870,111 +887,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
-        func addChoice(_ title: String, key: String, value: String, selected: Bool, to parent: NSMenu) {
-            let item = NSMenuItem(title: title, action: #selector(menuChoiceChanged(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = [key, value]
-            item.state = selected ? .on : .off
-            parent.addItem(item)
-        }
-        let sizeMenu = NSMenu()
-        for size in [18, 20, 22, 24, 26, 28, 30] {
-            addChoice("\(size) pt", key: "stripSize", value: "\(size)", selected: Int(CompanionPreferences.size) == size, to: sizeMenu)
-        }
-        let sizeItem = NSMenuItem(title: "Size", action: nil, keyEquivalent: "")
-        sizeItem.submenu = sizeMenu
-        menu.addItem(sizeItem)
-
-        let backgroundMenu = NSMenu()
-        for option in CompanionPreferences.Background.allCases {
-            addChoice(option.rawValue, key: "backgroundStyle", value: option.rawValue,
-                      selected: CompanionPreferences.background == option, to: backgroundMenu)
-        }
-        let backgroundItem = NSMenuItem(title: "Background", action: nil, keyEquivalent: "")
-        backgroundItem.submenu = backgroundMenu
-        menu.addItem(backgroundItem)
-
-        let accentMenu = NSMenu()
-        for color in ["Purple", "Blue", "Pink", "Orange", "Green", "System"] {
-            addChoice(color, key: "accentColor", value: color, selected: CompanionPreferences.accent == color, to: accentMenu)
-        }
-        let accentItem = NSMenuItem(title: "Accent", action: nil, keyEquivalent: "")
-        accentItem.submenu = accentMenu
-        menu.addItem(accentItem)
-        let spacingMenu = NSMenu()
-        for value in [2, 3, 4, 5, 6, 8, 10] {
-            addChoice("\(value) pt", key: "workspaceSpacing", value: "\(value)",
-                      selected: Int(CompanionPreferences.workspaceSpacing) == value, to: spacingMenu)
-        }
-        let spacingItem = NSMenuItem(title: "Workspace Spacing", action: nil, keyEquivalent: "")
-        spacingItem.submenu = spacingMenu
-        menu.addItem(spacingItem)
-
-        let iconSpacingMenu = NSMenu()
-        for value in [1, 2, 3, 4, 5, 6, 8] {
-            addChoice("\(value) pt", key: "iconSpacing", value: "\(value)",
-                      selected: Int(CompanionPreferences.iconSpacing) == value, to: iconSpacingMenu)
-        }
-        let iconSpacingItem = NSMenuItem(title: "App Icon Spacing", action: nil, keyEquivalent: "")
-        iconSpacingItem.submenu = iconSpacingMenu
-        menu.addItem(iconSpacingItem)
-
-        let opacityMenu = NSMenu()
-        for value in [45, 60, 75, 82, 90, 100] {
-            addChoice("\(value)%", key: "inactiveIconOpacity", value: String(Double(value) / 100),
-                      selected: Int(CompanionPreferences.inactiveIconOpacity * 100) == value, to: opacityMenu)
-        }
-        let opacityItem = NSMenuItem(title: "Inactive Icon Opacity", action: nil, keyEquivalent: "")
-        opacityItem.submenu = opacityMenu
-        menu.addItem(opacityItem)
-
-        let backgroundOpacityMenu = NSMenu()
-        for value in [10, 20, 35, 50, 65, 80, 92, 100] {
-            addChoice("\(value)%", key: "backgroundOpacity", value: String(Double(value) / 100),
-                      selected: Int(CompanionPreferences.backgroundOpacity * 100) == value, to: backgroundOpacityMenu)
-        }
-        let backgroundOpacityItem = NSMenuItem(title: "Background Opacity", action: nil, keyEquivalent: "")
-        backgroundOpacityItem.submenu = backgroundOpacityMenu
-        menu.addItem(backgroundOpacityItem)
-        menu.addItem(NSMenuItem.separator())
-        let statsItem = NSMenuItem(title: "System Stats…", action: #selector(showSystemStats), keyEquivalent: "")
-        statsItem.target = self
-        menu.addItem(statsItem)
-        let notchInfo = NSMenuItem(title: "Position & Notch: Managed by macOS", action: nil, keyEquivalent: "")
-        notchInfo.isEnabled = false
-        menu.addItem(notchInfo)
-        menu.addItem(NSMenuItem.separator())
-
-        func addToggle(_ title: String, key: String, value: Bool) {
-            let item = NSMenuItem(title: title, action: #selector(menuToggleChanged(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = key
-            item.state = value ? .on : .off
-            menu.addItem(item)
-        }
-        addToggle("Show only occupied workspaces", key: "occupiedOnly", value: CompanionPreferences.occupiedOnly)
-        addToggle("Show app icons", key: "showIcons", value: CompanionPreferences.showIcons)
-        addToggle("Show workspace labels", key: "showLabels", value: CompanionPreferences.showLabels)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "About Companion", action: #selector(showAbout), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Quit Companion", action: #selector(quit), keyEquivalent: "q").target = self
+        let quitItem = NSMenuItem(title: "Quit Companion", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
         return menu
-    }
-
-    @objc private func menuChoiceChanged(_ item: NSMenuItem) {
-        guard let values = item.representedObject as? [String], values.count == 2 else { return }
-        let value: Any
-        if ["stripSize", "workspaceSpacing", "iconSpacing", "inactiveIconOpacity", "backgroundOpacity"].contains(values[0]) {
-            value = Double(values[1]) ?? 22
-        } else { value = values[1] }
-        CompanionPreferences.save(values[0], value)
-        strip?.contextMenu = makeContextMenu()
-    }
-
-    @objc private func menuToggleChanged(_ item: NSMenuItem) {
-        guard let key = item.representedObject as? String else { return }
-        CompanionPreferences.save(key, item.state != .on)
-        strip?.contextMenu = makeContextMenu()
     }
 
     @objc private func preferencesChanged() {
