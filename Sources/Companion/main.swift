@@ -187,8 +187,11 @@ private final class AppIconCache {
     func image(for bundleID: String, size: CGFloat) -> NSImage? {
         let key = "\(bundleID)-\(Int(size))" as NSString
         if let image = cache.object(forKey: key) { return image }
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
-        let image = NSWorkspace.shared.icon(forFile: appURL.path)
+        // These icons belong to apps with live AeroSpace windows. Read the
+        // already-running application's icon directly instead of performing a
+        // synchronous LaunchServices URL lookup during menu-bar drawing.
+        guard let image = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.icon
+        else { return nil }
         image.size = NSSize(width: size, height: size)
         cache.setObject(image, forKey: key)
         return image
