@@ -485,22 +485,41 @@ private final class WorkspaceContentView: NSView {
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
+    private func pointerIsInsidePreviewOrAnchor() -> Bool {
+        let pointer = NSEvent.mouseLocation
+
+        if previewPopover?.contentViewController?.view.window?.frame
+            .insetBy(dx: -8, dy: -8).contains(pointer) == true {
+            return true
+        }
+
+        // The icon and popover are separate windows. Keep the preview alive while
+        // the pointer travels between them, including the small gap between surfaces.
+        if let anchor = previewAnchor,
+           let window = anchor.window {
+            let anchorInWindow = anchor.convert(anchor.bounds, to: nil)
+            let anchorOnScreen = window.convertToScreen(anchorInWindow)
+            if anchorOnScreen.insetBy(dx: -8, dy: -8).contains(pointer) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func schedulePreviewDismissal() {
         previewDismissWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.previewDismissWorkItem = nil
-            let pointer = NSEvent.mouseLocation
-            if self.previewPopover?.contentViewController?.view.window?.frame.contains(pointer) == true {
-                return
-            }
+            guard !self.pointerIsInsidePreviewOrAnchor() else { return }
             self.previewPopover?.close()
             self.previewPopover = nil
             self.previewAnchor = nil
-            self.previewDismissWorkItem = nil
         }
         previewDismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+        // Give the pointer enough time to cross the gap from the menu-bar icon
+        // into the separate preview panel. Entering either surface cancels this.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
 
     private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
