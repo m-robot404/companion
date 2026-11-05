@@ -1,4 +1,7 @@
 import AppKit
+import CoreGraphics
+import IOKit
+import MachO
 
 private enum CompanionPreferences {
     enum Background: String, CaseIterable {
@@ -19,6 +22,18 @@ private enum CompanionPreferences {
     static var occupiedOnly: Bool { defaults.object(forKey: "occupiedOnly") as? Bool ?? false }
     static var showIcons: Bool { defaults.object(forKey: "showIcons") as? Bool ?? true }
     static var showLabels: Bool { defaults.object(forKey: "showLabels") as? Bool ?? true }
+    static var workspaceSpacing: CGFloat {
+        CGFloat(defaults.object(forKey: "workspaceSpacing") as? Double ?? 5)
+    }
+    static var iconSpacing: CGFloat {
+        CGFloat(defaults.object(forKey: "iconSpacing") as? Double ?? 3)
+    }
+    static var inactiveIconOpacity: CGFloat {
+        CGFloat(defaults.object(forKey: "inactiveIconOpacity") as? Double ?? 0.82)
+    }
+    static var backgroundOpacity: CGFloat {
+        CGFloat(defaults.object(forKey: "backgroundOpacity") as? Double ?? 0.18)
+    }
 
     static var accentColor: NSColor {
         switch accent {
@@ -41,10 +56,36 @@ private extension Notification.Name {
     static let companionPreferencesChanged = Notification.Name("CompanionPreferencesChanged")
 }
 
+private struct WorkspaceWindow: Equatable {
+    let id: String
+    let bundleID: String
+    let appName: String
+    let title: String
+}
+
+private struct AppGroup: Equatable {
+    let bundleID: String
+    let appName: String
+    let windows: [WorkspaceWindow]
+}
+
 private struct Workspace: Equatable {
     let name: String
     let isFocused: Bool
-    let bundleIDs: [String]
+    let windows: [WorkspaceWindow]
+
+    var appGroups: [AppGroup] {
+        var order: [String] = []
+        var grouped: [String: [WorkspaceWindow]] = [:]
+        for window in windows {
+            if grouped[window.bundleID] == nil { order.append(window.bundleID) }
+            grouped[window.bundleID, default: []].append(window)
+        }
+        return order.compactMap { id in
+            guard let items = grouped[id], let first = items.first else { return nil }
+            return AppGroup(bundleID: id, appName: first.appName, windows: items)
+        }
+    }
 }
 
 private final class AeroSpaceClient {
@@ -78,16 +119,18 @@ private final class AeroSpaceClient {
     func snapshot() -> [Workspace]? {
         guard
             let workspaceText = run(["list-workspaces", "--all", "--format", "%{workspace}|%{workspace-is-focused}"]),
-            let windowText = run(["list-windows", "--all", "--format", "%{app-bundle-id}|%{workspace}"])
+            let windowText = run(["list-windows", "--all", "--format",
+                                  "%{window-id}%{tab}%{app-bundle-id}%{tab}%{app-name}%{tab}%{window-title}%{tab}%{workspace}"])
         else { return nil }
 
-        var apps: [String: [String]] = [:]
+        var windows: [String: [WorkspaceWindow]] = [:]
         for line in windowText.split(whereSeparator: \.isNewline) {
-            let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-            guard fields.count == 2, !fields[0].isEmpty, !fields[1].isEmpty else { continue }
-            if !apps[fields[1], default: []].contains(fields[0]) {
-                apps[fields[1], default: []].append(fields[0])
-            }
+            let fields = line.components(separatedBy: "\t")
+            guard fields.count >= 5, !fields[0].isEmpty, !fields[1].isEmpty, !fields[4].isEmpty else { continue }
+            let item = WorkspaceWindow(id: fields[0], bundleID: fields[1],
+                                       appName: fields[2].isEmpty ? fields[1] : fields[2],
+                                       title: fields[3].isEmpty ? (fields[2].isEmpty ? fields[1] : fields[2]) : fields[3])
+            windows[fields[4], default: []].append(item)
         }
 
         return workspaceText.split(whereSeparator: \.isNewline).compactMap { line in
@@ -96,12 +139,13 @@ private final class AeroSpaceClient {
             return Workspace(
                 name: name,
                 isFocused: fields.count > 1 && fields[1].trimmingCharacters(in: .whitespaces) == "true",
-                bundleIDs: apps[name, default: []]
+                windows: windows[name, default: []]
             )
         }
     }
 
     func focus(_ workspace: String) { _ = run(["workspace", workspace]) }
+    func focusWindow(_ id: String) { _ = run(["focus", "--window-id", id]) }
 
     func subscribe(pipe: Pipe, onExit: @escaping () -> Void) throws -> Process {
         guard let executable else {
@@ -141,20 +185,49 @@ private final class AppIconCache {
 private final class WorkspaceContentView: NSView {
     let workspace: Workspace
     let onSelect: (String) -> Void
+    let onFocusWindow: (String) -> Void
+    private var tracking: NSTrackingArea?
+    private var previewPopover: NSPopover?
+    private var hoveredGroupID: String?
 
-    init(workspace: Workspace, frame: NSRect, onSelect: @escaping (String) -> Void) {
+    init(workspace: Workspace, frame: NSRect,
+         onSelect: @escaping (String) -> Void,
+         onFocusWindow: @escaping (String) -> Void) {
         self.workspace = workspace
         self.onSelect = onSelect
+        self.onFocusWindow = onFocusWindow
         super.init(frame: frame)
         setAccessibilityRole(.button)
-        setAccessibilityLabel("Workspace \(workspace.name), \(workspace.bundleIDs.count) applications")
+        setAccessibilityLabel("Workspace \(workspace.name), \(workspace.windows.count) windows")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
 
+    private var scale: CGFloat { CompanionPreferences.size / 22 }
+    private var visibleGroups: [AppGroup] { Array(workspace.appGroups.prefix(3)) }
+
+    private func iconFrames() -> [(NSRect, AppGroup)] {
+        let label = CompanionPreferences.showLabels ? workspace.name : ""
+        let titleFont = NSFont.systemFont(ofSize: 11 * scale, weight: .semibold)
+        let titleSize = (label as NSString).size(withAttributes: [.font: titleFont])
+        let labelWidth = label.isEmpty ? 0 : max(11 * scale, ceil(titleSize.width))
+        var x = 7 * scale + labelWidth
+        if !label.isEmpty && !visibleGroups.isEmpty { x += 5 * scale }
+        var result: [(NSRect, AppGroup)] = []
+        guard CompanionPreferences.showIcons else { return result }
+        let iconSize = 15 * scale
+        for group in visibleGroups {
+            let badgeExtra: CGFloat = group.windows.count > 1 ? 5 * scale : 0
+            let frame = NSRect(x: x, y: floor((bounds.height - iconSize) / 2),
+                               width: iconSize + badgeExtra, height: iconSize)
+            result.append((frame, group))
+            x += iconSize + CompanionPreferences.iconSpacing * scale + badgeExtra
+        }
+        return result
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let scale = CompanionPreferences.size / 22
         let label = CompanionPreferences.showLabels ? workspace.name : ""
         let titleFont = NSFont.systemFont(ofSize: 11 * scale, weight: .semibold)
         let title = label as NSString
@@ -167,28 +240,40 @@ private final class WorkspaceContentView: NSView {
                                width: titleWidth, height: titleSize.height)
         if !label.isEmpty { title.draw(in: titleRect, withAttributes: titleAttributes) }
 
-        var x = titleRect.maxX + ((CompanionPreferences.showIcons && !workspace.bundleIDs.isEmpty) ? 5 * scale : 0)
-        if CompanionPreferences.showIcons {
-            let iconSize = 15 * scale
-            for bundleID in workspace.bundleIDs.prefix(3) {
-                if let icon = AppIconCache.shared.image(for: bundleID, size: iconSize) {
-                    icon.draw(in: NSRect(x: x, y: floor((bounds.height - iconSize) / 2),
-                                         width: iconSize, height: iconSize),
-                              from: .zero, operation: .sourceOver, fraction: 1)
-                }
-                x += iconSize + 3 * scale
+        for (frame, group) in iconFrames() {
+            if let icon = AppIconCache.shared.image(for: group.bundleID, size: 15 * scale) {
+                icon.draw(in: NSRect(x: frame.minX, y: frame.minY, width: 15 * scale, height: 15 * scale),
+                          from: .zero, operation: .sourceOver,
+                          fraction: workspace.isFocused ? 1 : CompanionPreferences.inactiveIconOpacity)
             }
-            if workspace.bundleIDs.count > 3 {
-                x -= 3 * scale
-                let more = "+\(workspace.bundleIDs.count - 3)" as NSString
-                let attributes: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 9 * scale, weight: .medium),
-                    .foregroundColor: NSColor.secondaryLabelColor
+            if group.windows.count > 1 {
+                let badge = "\(group.windows.count)" as NSString
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 7 * scale, weight: .bold),
+                    .foregroundColor: NSColor.white
                 ]
-                let size = more.size(withAttributes: attributes)
-                more.draw(in: NSRect(x: x + 2 * scale, y: floor((bounds.height - size.height) / 2),
-                                     width: size.width, height: size.height), withAttributes: attributes)
+                let badgeSize = badge.size(withAttributes: attrs)
+                let badgeRect = NSRect(x: frame.maxX - badgeSize.width - 1 * scale,
+                                       y: frame.minY - 1 * scale,
+                                       width: badgeSize.width + 2 * scale,
+                                       height: badgeSize.height + 1 * scale)
+                CompanionPreferences.accentColor.setFill()
+                NSBezierPath(roundedRect: badgeRect, xRadius: 4 * scale, yRadius: 4 * scale).fill()
+                badge.draw(in: badgeRect.insetBy(dx: 1 * scale, dy: 0), withAttributes: attrs)
             }
+        }
+
+        if workspace.appGroups.count > 3 {
+            let more = "+\(workspace.appGroups.count - 3)" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9 * scale, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            let size = more.size(withAttributes: attrs)
+            more.draw(in: NSRect(x: iconFrames().last?.0.maxX ?? titleRect.maxX,
+                                 y: floor((bounds.height - size.height) / 2),
+                                 width: size.width + 3 * scale, height: size.height),
+                      withAttributes: attrs)
         }
 
         if workspace.isFocused {
@@ -201,7 +286,105 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    override func mouseDown(with event: NSEvent) { onSelect(workspace.name) }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    private func group(at point: NSPoint) -> AppGroup? {
+        iconFrames().first(where: { $0.0.insetBy(dx: -2, dy: -2).contains(point) })?.1
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let group = group(at: point) else {
+            previewPopover?.close()
+            previewPopover = nil
+            hoveredGroupID = nil
+            return
+        }
+        guard hoveredGroupID != group.bundleID else { return }
+        hoveredGroupID = group.bundleID
+        showPreview(for: group, at: point)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        previewPopover?.close()
+        previewPopover = nil
+        hoveredGroupID = nil
+    }
+
+    private func showPreview(for group: AppGroup, at point: NSPoint) {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        let controller = NSViewController()
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 156))
+        host.wantsLayer = true
+        host.layer?.cornerRadius = 10
+        let imageView = NSImageView(frame: NSRect(x: 12, y: 38, width: 208, height: 106))
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.image = previewImage(for: group.windows[0]) ??
+            AppIconCache.shared.image(for: group.bundleID, size: 64)
+        host.addSubview(imageView)
+        let title = NSTextField(labelWithString: group.windows[0].title)
+        title.frame = NSRect(x: 12, y: 10, width: 208, height: 20)
+        title.lineBreakMode = .byTruncatingMiddle
+        title.font = .systemFont(ofSize: 11, weight: .medium)
+        host.addSubview(title)
+        if group.windows.count > 1 {
+            let count = NSTextField(labelWithString: "\(group.windows.count) windows — click to choose")
+            count.frame = NSRect(x: 12, y: 26, width: 208, height: 12)
+            count.font = .systemFont(ofSize: 9)
+            count.textColor = .secondaryLabelColor
+            host.addSubview(count)
+        }
+        controller.view = host
+        popover.contentViewController = controller
+        popover.show(relativeTo: NSRect(x: point.x - 2, y: point.y, width: 4, height: 2),
+                     of: self, preferredEdge: .maxY)
+        previewPopover = popover
+    }
+
+    private func previewImage(for window: WorkspaceWindow) -> NSImage? {
+        guard CGPreflightScreenCaptureAccess(),
+              let id = UInt32(window.id),
+              let image = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(id), [.bestResolution])
+        else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        previewPopover?.close()
+        previewPopover = nil
+        guard let group = group(at: point) else {
+            onSelect(workspace.name)
+            return
+        }
+        if group.windows.count == 1, let window = group.windows.first {
+            onFocusWindow(window.id)
+            return
+        }
+        let menu = NSMenu()
+        for window in group.windows {
+            let title = window.title.isEmpty ? group.appName : window.title
+            let item = NSMenuItem(title: title, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = window.id
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func selectWindowFromMenu(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? String else { return }
+        onFocusWindow(id)
+    }
 }
 
 @MainActor
@@ -221,7 +404,7 @@ private final class WorkspaceStripView: NSView {
         NSMenu.popUpContextMenu(contextMenu, with: event, for: self)
     }
 
-    private var gap: CGFloat { 5 * CompanionPreferences.size / 22 }
+    private var gap: CGFloat { CompanionPreferences.workspaceSpacing * CompanionPreferences.size / 22 }
     private var measuredWidth: CGFloat {
         guard !workspaces.isEmpty else { return 1 }
         return workspaces.reduce(0) { $0 + compartmentWidth(for: $1) }
@@ -234,25 +417,31 @@ private final class WorkspaceStripView: NSView {
         let font = NSFont.systemFont(ofSize: 11 * scale, weight: .semibold)
         let labelWidth = label.isEmpty ? 0 : max(11 * scale, ceil((label as NSString).size(withAttributes: [.font: font]).width))
         var width = 14 * scale + labelWidth
-        if CompanionPreferences.showIcons && !workspace.bundleIDs.isEmpty {
-            let visible = min(3, workspace.bundleIDs.count)
-            width += 5 * scale + CGFloat(visible) * 15 * scale + CGFloat(max(0, visible - 1)) * 3 * scale
-            if workspace.bundleIDs.count > 3 {
-                let more = "+\(workspace.bundleIDs.count - 3)" as NSString
+        if CompanionPreferences.showIcons && !workspace.appGroups.isEmpty {
+            let visible = min(3, workspace.appGroups.count)
+            width += 5 * scale + CGFloat(visible) * 15 * scale
+                + CGFloat(max(0, visible - 1)) * CompanionPreferences.iconSpacing * scale
+                + CGFloat(workspace.appGroups.prefix(visible).filter { $0.windows.count > 1 }.count) * 5 * scale
+            if workspace.appGroups.count > 3 {
+                let more = "+\(workspace.appGroups.count - 3)" as NSString
                 width += 5 * scale + ceil(more.size(withAttributes: [
                     .font: NSFont.systemFont(ofSize: 9 * scale, weight: .medium)
                 ]).width)
             }
         }
-        if !workspace.bundleIDs.isEmpty { width = max(width, 44 * scale) }
+        if !workspace.windows.isEmpty { width = max(width, 44 * scale) }
         return ceil(max(24 * scale, width))
     }
 
-    func update(workspaces: [Workspace], onSelect: @escaping (String) -> Void) {
+    private var focusWindow: ((String) -> Void)?
+
+    func update(workspaces: [Workspace], onSelect: @escaping (String) -> Void,
+                onFocusWindow: @escaping (String) -> Void) {
         self.workspaces = CompanionPreferences.occupiedOnly
-            ? workspaces.filter { !$0.bundleIDs.isEmpty || $0.isFocused }
+            ? workspaces.filter { !$0.windows.isEmpty || $0.isFocused }
             : workspaces
         selection = onSelect
+        focusWindow = onFocusWindow
         glassContainer?.removeFromSuperview()
         glassContainer = nil
         compartmentViews.forEach { $0.removeFromSuperview() }
@@ -266,12 +455,15 @@ private final class WorkspaceStripView: NSView {
         for workspace in self.workspaces {
             let frame = NSRect(x: x, y: 0, width: compartmentWidth(for: workspace), height: height)
             let content = WorkspaceContentView(workspace: workspace, frame: NSRect(origin: .zero, size: frame.size),
-                                                onSelect: onSelect)
+                                                onSelect: onSelect,
+                                                onFocusWindow: { [weak self] id in self?.focusWindow?(id) })
             let background: NSView
             if CompanionPreferences.background == .glass {
                 let glass = NSGlassEffectView(frame: frame)
                 glass.cornerRadius = 9 * scale
-                if workspace.isFocused { glass.tintColor = CompanionPreferences.accentColor.withAlphaComponent(0.22) }
+                glass.tintColor = workspace.isFocused
+                    ? CompanionPreferences.accentColor.withAlphaComponent(0.22)
+                    : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)
                 glass.contentView = content
                 background = glass
             } else {
@@ -318,13 +510,97 @@ private final class CompartmentBackgroundView: NSView {
                                 xRadius: 9 * CompanionPreferences.size / 22,
                                 yRadius: 9 * CompanionPreferences.size / 22)
         if style == .solid {
-            (focused ? CompanionPreferences.accentColor.withAlphaComponent(0.32) : NSColor.controlBackgroundColor.withAlphaComponent(0.92)).setFill()
+            (focused ? CompanionPreferences.accentColor.withAlphaComponent(min(1, CompanionPreferences.backgroundOpacity + 0.2))
+                     : NSColor.controlBackgroundColor.withAlphaComponent(CompanionPreferences.backgroundOpacity)).setFill()
             path.fill()
         }
         if focused {
             CompanionPreferences.accentColor.withAlphaComponent(0.7).setStroke()
             path.lineWidth = 1
             path.stroke()
+        }
+    }
+}
+
+
+@MainActor
+private final class SystemStatsPopoverController: NSObject {
+    private let popover = NSPopover()
+    private let cpuLabel = NSTextField(labelWithString: "CPU: measuring…")
+    private let memoryLabel = NSTextField(labelWithString: "Memory: measuring…")
+    private let footprintLabel = NSTextField(labelWithString: "Companion: measuring…")
+
+    func show(from anchor: NSView?) {
+        guard let anchor else { return }
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 100))
+        for (label, y) in [(cpuLabel, 66.0), (memoryLabel, 40.0), (footprintLabel, 14.0)] {
+            label.frame = NSRect(x: 14, y: y, width: 192, height: 18)
+            label.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+            host.addSubview(label)
+        }
+        let content = NSViewController()
+        content.view = host
+        popover.contentViewController = content
+        popover.behavior = .transient
+        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        refreshMemory()
+        measureCPU()
+        measureFootprint()
+    }
+
+    private func refreshMemory() {
+        let total = ProcessInfo.processInfo.physicalMemory
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { memoryLabel.stringValue = "Memory: unavailable"; return }
+        let page = UInt64(vm_kernel_page_size)
+        let usedPages = UInt64(stats.active_count + stats.inactive_count + stats.wire_count + stats.compressor_page_count)
+        let used = min(total, usedPages * page)
+        memoryLabel.stringValue = String(format: "Memory: %.1f / %.1f GB", Double(used) / 1_073_741_824,
+                                         Double(total) / 1_073_741_824)
+    }
+
+    private func cpuTicks() -> [UInt32]? {
+        var info = host_cpu_load_info_data_t()
+        var count = mach_msg_type_number_t(HOST_CPU_LOAD_INFO_COUNT)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return [info.cpu_ticks.0, info.cpu_ticks.1, info.cpu_ticks.2, info.cpu_ticks.3]
+    }
+
+    private func measureCPU() {
+        guard let first = cpuTicks() else { cpuLabel.stringValue = "CPU: unavailable"; return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, let second = self.cpuTicks() else { return }
+            let deltas = zip(first, second).map { Double($1 &- $0) }
+            let total = deltas.reduce(0, +)
+            let idle = deltas[3]
+            let usage = total > 0 ? (total - idle) / total * 100 : 0
+            self.cpuLabel.stringValue = String(format: "CPU: %.1f%% system", usage)
+        }
+    }
+
+    private func measureFootprint() {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if result == KERN_SUCCESS {
+            footprintLabel.stringValue = String(format: "Companion: %.1f MB", Double(info.phys_footprint) / 1_048_576)
+        } else {
+            footprintLabel.stringValue = "Companion: unavailable"
         }
     }
 }
@@ -348,6 +624,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: 1)
+        item.autosaveName = "com.m-robot404.Companion.workspaceStrip"
         statusItem = item
         guard let button = item.button else { return }
         button.title = ""
@@ -380,6 +657,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showAbout() { NSApp.orderFrontStandardAboutPanel(nil) }
+    @objc private func showSystemStats() {
+        let controller = SystemStatsPopoverController()
+        controller.show(from: statusItem?.button)
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func makeContextMenu() -> NSMenu {
@@ -415,6 +696,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let accentItem = NSMenuItem(title: "Accent", action: nil, keyEquivalent: "")
         accentItem.submenu = accentMenu
         menu.addItem(accentItem)
+        let spacingMenu = NSMenu()
+        for value in [2, 3, 4, 5, 6, 8, 10] {
+            addChoice("\(value) pt", key: "workspaceSpacing", value: "\(value)",
+                      selected: Int(CompanionPreferences.workspaceSpacing) == value, to: spacingMenu)
+        }
+        let spacingItem = NSMenuItem(title: "Workspace Spacing", action: nil, keyEquivalent: "")
+        spacingItem.submenu = spacingMenu
+        menu.addItem(spacingItem)
+
+        let opacityMenu = NSMenu()
+        for value in [45, 60, 75, 82, 90, 100] {
+            addChoice("\(value)%", key: "inactiveIconOpacity", value: String(Double(value) / 100),
+                      selected: Int(CompanionPreferences.inactiveIconOpacity * 100) == value, to: opacityMenu)
+        }
+        let opacityItem = NSMenuItem(title: "Inactive Icon Opacity", action: nil, keyEquivalent: "")
+        opacityItem.submenu = opacityMenu
+        menu.addItem(opacityItem)
+
+        let backgroundOpacityMenu = NSMenu()
+        for value in [5, 10, 18, 25, 35, 50, 70, 100] {
+            addChoice("\(value)%", key: "backgroundOpacity", value: String(Double(value) / 100),
+                      selected: Int(CompanionPreferences.backgroundOpacity * 100) == value, to: backgroundOpacityMenu)
+        }
+        let backgroundOpacityItem = NSMenuItem(title: "Background Opacity", action: nil, keyEquivalent: "")
+        backgroundOpacityItem.submenu = backgroundOpacityMenu
+        menu.addItem(backgroundOpacityItem)
+        menu.addItem(NSMenuItem.separator())
+        let statsItem = NSMenuItem(title: "System Stats…", action: #selector(showSystemStats), keyEquivalent: "")
+        statsItem.target = self
+        menu.addItem(statsItem)
+        let notchInfo = NSMenuItem(title: "Position & Notch: Managed by macOS", action: nil, keyEquivalent: "")
+        notchInfo.isEnabled = false
+        menu.addItem(notchInfo)
         menu.addItem(NSMenuItem.separator())
 
         func addToggle(_ title: String, key: String, value: Bool) {
@@ -436,8 +750,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuChoiceChanged(_ item: NSMenuItem) {
         guard let values = item.representedObject as? [String], values.count == 2 else { return }
         let value: Any
-        if values[0] == "stripSize" { value = Double(values[1]) ?? 22 }
-        else { value = values[1] }
+        if ["stripSize", "workspaceSpacing", "inactiveIconOpacity", "backgroundOpacity"].contains(values[0]) {
+            value = Double(values[1]) ?? 22
+        } else { value = values[1] }
         CompanionPreferences.save(values[0], value)
         strip?.contextMenu = makeContextMenu()
     }
@@ -456,11 +771,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func applicationLifecycleChanged(_ notification: Notification) { scheduleRefresh() }
 
     private func renderWorkspaces() {
-        strip?.update(workspaces: currentWorkspaces) { [weak self] name in
+        strip?.update(workspaces: currentWorkspaces, onSelect: { [weak self] name in
             guard let self else { return }
             DispatchQueue.global(qos: .userInteractive).async { [client = self.client] in client.focus(name) }
             self.scheduleRefresh()
-        }
+        }, onFocusWindow: { [weak self] id in
+            guard let self else { return }
+            DispatchQueue.global(qos: .userInteractive).async { [client = self.client] in client.focusWindow(id) }
+            self.scheduleRefresh()
+        })
         statusItem?.length = max(1, ceil(strip?.intrinsicContentSize.width ?? 1))
     }
 
