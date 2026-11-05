@@ -181,14 +181,37 @@ private final class AppIconCache {
     }
 }
 
+
+@MainActor
+private final class WorkspaceIconHitView: NSView {
+    var onEnter: ((NSView) -> Void)?
+    var onExit: (() -> Void)?
+    var onPress: ((NSEvent) -> Void)?
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter?(self) }
+    override func mouseExited(with event: NSEvent) { onExit?() }
+    override func mouseDown(with event: NSEvent) { onPress?(event) }
+}
+
 @MainActor
 private final class WorkspaceContentView: NSView {
     let workspace: Workspace
     let onSelect: (String) -> Void
     let onFocusWindow: (String) -> Void
-    private var tracking: NSTrackingArea?
     private var previewPopover: NSPopover?
-    private var hoveredGroupID: String?
+    private weak var previewAnchor: NSView?
+    private var iconHitViews: [WorkspaceIconHitView] = []
 
     init(workspace: Workspace, frame: NSRect,
          onSelect: @escaping (String) -> Void,
@@ -199,6 +222,7 @@ private final class WorkspaceContentView: NSView {
         super.init(frame: frame)
         setAccessibilityRole(.button)
         setAccessibilityLabel("Workspace \(workspace.name), \(workspace.windows.count) windows")
+        installIconHitTargets()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
@@ -286,40 +310,51 @@ private final class WorkspaceContentView: NSView {
         }
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    private func group(at point: NSPoint) -> AppGroup? {
-        iconFrames().first(where: { $0.0.insetBy(dx: -2, dy: -2).contains(point) })?.1
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        guard let group = group(at: point) else {
-            previewPopover?.close()
-            previewPopover = nil
-            hoveredGroupID = nil
-            return
+    private func installIconHitTargets() {
+        iconHitViews.forEach { $0.removeFromSuperview() }
+        iconHitViews.removeAll()
+        for (frame, group) in iconFrames() {
+            let target = WorkspaceIconHitView(frame: frame)
+            target.onEnter = { [weak self] anchor in
+                self?.showPreview(for: group, anchoredTo: anchor)
+            }
+            target.onExit = { [weak self, weak target] in
+                guard let self, self.previewAnchor === target else { return }
+                self.previewPopover?.close()
+                self.previewPopover = nil
+                self.previewAnchor = nil
+            }
+            target.onPress = { [weak self] event in
+                self?.activate(group, event: event)
+            }
+            target.setAccessibilityRole(.button)
+            target.setAccessibilityLabel(group.windows.count == 1
+                ? group.appName : "\(group.appName), \(group.windows.count) windows")
+            addSubview(target)
+            iconHitViews.append(target)
         }
-        guard hoveredGroupID != group.bundleID else { return }
-        hoveredGroupID = group.bundleID
-        showPreview(for: group, at: point)
     }
 
-    override func mouseExited(with event: NSEvent) {
+    private func activate(_ group: AppGroup, event: NSEvent) {
         previewPopover?.close()
         previewPopover = nil
-        hoveredGroupID = nil
+        previewAnchor = nil
+        if group.windows.count == 1, let window = group.windows.first {
+            onFocusWindow(window.id)
+            return
+        }
+        let menu = NSMenu()
+        for window in group.windows {
+            let title = window.title.isEmpty ? group.appName : window.title
+            let item = NSMenuItem(title: title, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = window.id
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    private func showPreview(for group: AppGroup, at point: NSPoint) {
+    private func showPreview(for group: AppGroup, anchoredTo anchor: NSView) {
         let popover = NSPopover()
         popover.behavior = .transient
         let controller = NSViewController()
@@ -349,51 +384,46 @@ private final class WorkspaceContentView: NSView {
         }
         controller.view = host
         popover.contentViewController = controller
-        popover.show(relativeTo: NSRect(x: point.x - 2, y: point.y, width: 4, height: 2),
-                     of: self, preferredEdge: .maxY)
+        popover.show(relativeTo: NSRect(x: anchor.bounds.midX - 2, y: anchor.bounds.midY,
+                                        width: 4, height: 2),
+                     of: anchor, preferredEdge: .maxY)
+        previewAnchor = anchor
         previewPopover = popover
     }
 
     private func previewImage(for window: WorkspaceWindow) async -> NSImage? {
         guard CGPreflightScreenCaptureAccess(), let id = UInt32(window.id) else { return nil }
+        let windowID = CGWindowID(id)
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let target = content.windows.first(where: { $0.windowID == CGWindowID(id) }) else { return nil }
-            let filter = SCContentFilter(desktopIndependentWindow: target)
-            let configuration = SCStreamConfiguration()
-            configuration.width = 480
-            configuration.height = 270
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+            if let target = content.windows.first(where: { $0.windowID == windowID }) {
+                let filter = SCContentFilter(desktopIndependentWindow: target)
+                let configuration = SCStreamConfiguration()
+                configuration.width = 480
+                configuration.height = 270
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: filter,
+                    configuration: configuration
+                )
+                return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+            }
         } catch {
+            // Fall through to the Core Graphics window-capture path.
+        }
+
+        // ScreenCaptureKit can omit transient or newly-created windows from its shareable list.
+        // Core Graphics can still capture a known AeroSpace window ID directly.
+        guard let image = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, .bestResolution) else {
             return nil
         }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
         previewPopover?.close()
         previewPopover = nil
-        guard let group = group(at: point) else {
-            onSelect(workspace.name)
-            return
-        }
-        if group.windows.count == 1, let window = group.windows.first {
-            onFocusWindow(window.id)
-            return
-        }
-        let menu = NSMenu()
-        for window in group.windows {
-            let title = window.title.isEmpty ? group.appName : window.title
-            let item = NSMenuItem(title: title, action: #selector(selectWindowFromMenu(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = window.id
-            menu.addItem(item)
-        }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
+        previewAnchor = nil
+        onSelect(workspace.name)
     }
 
     @objc private func selectWindowFromMenu(_ item: NSMenuItem) {
